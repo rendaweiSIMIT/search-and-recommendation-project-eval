@@ -68,6 +68,11 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Dense-log branch: when True, prepend SignedLog1p() to user_dense_proj /
+    # item_dense_proj. Must match the value PCVRHyFormer was trained with so
+    # the SignedLog1p layer (which has no learnable params) sits at the same
+    # position in nn.Sequential and downstream Linear shapes line up.
+    'dense_log_transform': True,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

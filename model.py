@@ -97,6 +97,18 @@ def apply_rope_to_tensor(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class SignedLog1p(nn.Module):
+    """Element-wise sign(x) * log1p(|x|).
+
+    Identity-like near 0, compresses large magnitudes. Useful as a pre-norm for
+    dense feature columns whose raw values span many orders of magnitude
+    (e.g., raw counters mixed with already-normalized embeddings).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+
+
 class SwiGLU(nn.Module):
     """SwiGLU activation: x1 * SiLU(x2)."""
 
@@ -1229,6 +1241,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Dense-feature input compression
+        dense_log_transform: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1258,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.dense_log_transform = dense_log_transform
 
         # ================== NS Tokens Construction ==================
 
@@ -1295,21 +1310,33 @@ class PCVRHyFormer(nn.Module):
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
-        # User dense feature projection (if available)
+        # User dense feature projection (if available).
+        # When dense_log_transform=True, signed log1p compresses raw-counter
+        # columns (e.g. user_dense_62-66 with values up to 1e7) so they don't
+        # dominate the linear projection over already-normalized columns
+        # (e.g. user_dense_61, 87, 89-91 in [-1, 1]).
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
+            user_dense_layers = []
+            if dense_log_transform:
+                user_dense_layers.append(SignedLog1p())
+            user_dense_layers.extend([
                 nn.Linear(user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
-            )
+            ])
+            self.user_dense_proj = nn.Sequential(*user_dense_layers)
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
         if self.has_item_dense:
-            self.item_dense_proj = nn.Sequential(
+            item_dense_layers = []
+            if dense_log_transform:
+                item_dense_layers.append(SignedLog1p())
+            item_dense_layers.extend([
                 nn.Linear(item_dense_dim, d_model),
                 nn.LayerNorm(d_model),
-            )
+            ])
+            self.item_dense_proj = nn.Sequential(*item_dense_layers)
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
