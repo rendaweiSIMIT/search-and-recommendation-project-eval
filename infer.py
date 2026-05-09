@@ -68,6 +68,10 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # seq-hash branch: rescue high-card seq features by hashing into N
+    # buckets (0 = baseline behavior of skipping). When > 0 the model
+    # builds a ``seq_hash_size + 1`` table and applies modulo at lookup.
+    'seq_hash_size': 0,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
