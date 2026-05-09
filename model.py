@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -16,6 +16,9 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Synthesized context features keyed by name; consumed only when the
+    # corresponding feature flag (e.g. use_null_pattern) is on.
+    context_feats: Optional[Dict[str, torch.Tensor]] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1229,6 +1232,11 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Null-pattern feature: when True, add one extra NS token from the
+        # joint missingness pattern of user_int_99..103 (5 bits -> 0..31).
+        # To keep T = 16 under d_model = 64, run.sh reduces user_ns_tokens
+        # 5 -> 4.
+        use_null_pattern: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1252,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_null_pattern = bool(use_null_pattern)
 
         # ================== NS Tokens Construction ==================
 
@@ -1311,9 +1320,22 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ================== Null-pattern token (optional, +1 NS token) ==================
+        if self.use_null_pattern:
+            # 5-bit categorical (0..31) -> d_model.
+            self.null_pattern_emb = nn.Embedding(32, d_model)
+            self.null_pattern_proj = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                "Null-pattern token enabled: ctx_null_pattern_99_103 -> "
+                "1 extra NS token")
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if self.use_null_pattern else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1645,6 +1667,11 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.use_null_pattern:
+            cf = inputs.context_feats or {}
+            np_emb = self.null_pattern_emb(cf['ctx_null_pattern_99_103'].long())
+            np_tok = F.silu(self.null_pattern_proj(np_emb)).unsqueeze(1)
+            ns_parts.append(np_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1688,6 +1715,11 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.use_null_pattern:
+            cf = inputs.context_feats or {}
+            np_emb = self.null_pattern_emb(cf['ctx_null_pattern_99_103'].long())
+            np_tok = F.silu(self.null_pattern_proj(np_emb)).unsqueeze(1)
+            ns_parts.append(np_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 

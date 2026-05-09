@@ -570,6 +570,22 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- Synthesized context feature: null-pattern of user_int_99..103 ----
+        # These five columns each have 82-92% null per the platform recon.
+        # Their JOINT missingness pattern (5 bits -> 0..31 categorical)
+        # likely segments users (logged-in vs not, new vs old account, ...).
+        # Computed BEFORE fill_null/clip so we can detect "originally null"
+        # vs "originally 0".
+        null_pattern_99_103 = np.zeros(B, dtype=np.int64)
+        for bit, fid in enumerate([99, 100, 101, 102, 103]):
+            col_name = f'user_int_feats_{fid}'
+            ci = self._col_idx.get(col_name)
+            if ci is None:
+                continue
+            null_np = (batch.column(ci).is_null()
+                            .to_numpy(zero_copy_only=False).astype(np.int64))
+            null_pattern_99_103 |= (null_np << bit)
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
@@ -579,6 +595,7 @@ class PCVRParquetDataset(IterableDataset):
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
+            'ctx_null_pattern_99_103': torch.from_numpy(null_pattern_99_103),
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
