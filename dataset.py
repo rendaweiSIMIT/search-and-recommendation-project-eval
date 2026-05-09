@@ -570,6 +570,47 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- Synthesized context features ----
+        # 1) hour-of-day (0-23) derived from the impression timestamp.
+        #    Ad CTR/CVR has strong diurnal periodicity; the dataset spans only
+        #    3.86 days but each hour-of-day value still appears 3-4 times,
+        #    which is enough for the model to learn the cycle.
+        hour_of_day = ((timestamps // 3600) % 24).astype(np.int64)
+
+        # 2) item_in_c47: does the current item_id appear anywhere in this
+        #    user's domain_c_seq_47 history? c_seq_47 has elem_range up to
+        #    86.34M which exactly matches item_id's max=86.55M, so c_seq_47
+        #    almost certainly is the user's item-id history. "user has seen
+        #    this item before" is a classic strong signal for PCVR.
+        item_in_c47 = np.zeros(B, dtype=np.int64)
+        if 'item_id' in self._col_idx and 'domain_c_seq_47' in self._col_idx:
+            item_id_arr = (batch.column(self._col_idx['item_id'])
+                                .fill_null(0)
+                                .to_numpy(zero_copy_only=False)
+                                .astype(np.int64))
+            c47_col = batch.column(self._col_idx['domain_c_seq_47'])
+            c47_offsets = c47_col.offsets.to_numpy()
+            c47_values = c47_col.values.to_numpy()
+            for i in range(B):
+                s = int(c47_offsets[i])
+                e = int(c47_offsets[i + 1])
+                if e > s and (c47_values[s:e] == item_id_arr[i]).any():
+                    item_in_c47[i] = 1
+
+        # 3) null_pattern_99_103: 5-bit categorical (0..31) encoding which of
+        #    user_int_feats_{99..103} are null. These columns are 82-92% null
+        #    individually, and the missing pattern itself likely segments
+        #    users (e.g. logged-out vs logged-in, new vs old account).
+        null_pattern_99_103 = np.zeros(B, dtype=np.int64)
+        for bit, fid in enumerate([99, 100, 101, 102, 103]):
+            col_name = f'user_int_feats_{fid}'
+            ci = self._col_idx.get(col_name)
+            if ci is None:
+                continue
+            null_np = (batch.column(ci).is_null()
+                            .to_numpy(zero_copy_only=False).astype(np.int64))
+            null_pattern_99_103 |= (null_np << bit)
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
@@ -579,6 +620,11 @@ class PCVRParquetDataset(IterableDataset):
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
+            # Synthesized context features (always computed; consumed only
+            # when the model is built with use_context_features=True).
+            'ctx_hour': torch.from_numpy(hour_of_day),
+            'ctx_item_in_c47': torch.from_numpy(item_in_c47),
+            'ctx_null_pattern_99_103': torch.from_numpy(null_pattern_99_103),
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----

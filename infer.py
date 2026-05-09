@@ -68,6 +68,14 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # feature-eng-bundle: rescue high-card seq features by hashing into N
+    # buckets (0 = baseline behavior of skipping). When > 0 the model creates
+    # a ``seq_hash_size + 1`` embedding table and applies modulo at lookup.
+    'seq_hash_size': 0,
+    # feature-eng-bundle: enable ContextTokenizer (hour-of-day, item_in_c47,
+    # null_pattern_99_103 -> 1 extra NS token). Resolved straight from
+    # train_config.json by ``_MODEL_CFG_KEYS``.
+    'use_context_features': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -292,6 +300,14 @@ def _batch_to_model_input(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
+    # Forward synthesized context features when present in the batch dict.
+    # The model ignores them unless built with use_context_features=True.
+    context_feats = {
+        k: device_batch[k]
+        for k in ('ctx_hour', 'ctx_item_in_c47', 'ctx_null_pattern_99_103')
+        if k in device_batch
+    } or None
+
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
@@ -300,6 +316,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        context_feats=context_feats,
     )
 
 

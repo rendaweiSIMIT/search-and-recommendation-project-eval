@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -16,6 +16,9 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Synthesized context features (hour-of-day, item-in-c47, null-pattern of
+    # user_int_99..103). May be None when context tokenizer is disabled.
+    context_feats: Optional[Dict[str, torch.Tensor]] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1189,6 +1192,52 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class ContextTokenizer(nn.Module):
+    """Aggregates synthesized context features into a single d_model NS token.
+
+    Inputs:
+      - hour: (B,) long, values in [0, 23]
+      - item_match: (B,) long, values in {0, 1}
+      - null_pattern: (B,) long, values in [0, 31] (5-bit pattern of which
+        of user_int_99..103 are null)
+
+    Each lookup contributes a slice of d_model; concat -> Linear -> LN -> SiLU
+    yields one (B, 1, d_model) NS token. Slices are sized so they sum to
+    exactly d_model: hour 1/2 d_model, item_match and null_pattern 1/4 each.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_hours: int = 24,
+        num_match_states: int = 2,
+        num_null_patterns: int = 32,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        h_dim = d_model // 2
+        m_dim = d_model // 4
+        n_dim = d_model - h_dim - m_dim  # absorbs any rounding remainder
+        self.hour_emb = nn.Embedding(num_hours, h_dim)
+        self.match_emb = nn.Embedding(num_match_states, m_dim)
+        self.null_emb = nn.Embedding(num_null_patterns, n_dim)
+        self.proj = nn.Linear(d_model, d_model)
+        self.ln = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        hour: torch.Tensor,
+        item_match: torch.Tensor,
+        null_pattern: torch.Tensor,
+    ) -> torch.Tensor:
+        h = self.hour_emb(hour.long())          # (B, h_dim)
+        m = self.match_emb(item_match.long())   # (B, m_dim)
+        n = self.null_emb(null_pattern.long())  # (B, n_dim)
+        x = torch.cat([h, m, n], dim=-1)        # (B, d_model)
+        x = self.ln(self.proj(x))
+        return F.silu(x).unsqueeze(1)           # (B, 1, d_model)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1278,16 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Hash-trick rescue for sequence features whose vocab exceeds
+        # ``emb_skip_threshold``. When >0, instead of skipping the embedding
+        # entirely, the model creates a small ``seq_hash_size``-bucket table
+        # and looks up ``((id - 1) % seq_hash_size + 1)`` (id==0 stays as
+        # padding). 0 = baseline behavior (skip + emit zero vector).
+        seq_hash_size: int = 0,
+        # Synthesized context features (hour-of-day, item-in-c47, null-pattern
+        # of user_int_99..103). When True, the model adds a ``ContextTokenizer``
+        # that produces one extra NS token from inputs.context_feats.
+        use_context_features: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1303,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.seq_hash_size = int(seq_hash_size)
+        self.use_context_features = bool(use_context_features)
 
         # ================== NS Tokens Construction ==================
 
@@ -1311,9 +1372,17 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ================== Context Tokenizer (optional, +1 NS token) ==================
+        if self.use_context_features:
+            self.context_tokenizer = ContextTokenizer(d_model=d_model)
+            logging.info(
+                "ContextTokenizer enabled: hour-of-day + item_in_c47 + "
+                "null_pattern_99_103 -> 1 extra NS token")
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if self.use_context_features else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1332,15 +1401,33 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_emb_dropout = nn.Dropout(dropout_rate * 2)
 
         def _make_seq_embs(vocab_sizes):
-            """Create embedding list, returning None for features skipped via
-            emb_skip_threshold or with no vocab info (vs<=0)."""
+            """Create embedding list. For features whose vocab exceeds
+            ``emb_skip_threshold`` we either skip (baseline) or build a
+            small ``seq_hash_size``-bucket table when hashing is enabled.
+            Returns (module_list, index_map, is_id, is_hashed)."""
             embs_raw = []
+            is_hashed_raw: List[bool] = []
             for vs in vocab_sizes:
-                skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
-                if skip:
+                vs_int = int(vs)
+                if vs_int <= 0:
+                    # No vocab info -> skip outright (no signal to recover).
                     embs_raw.append(None)
+                    is_hashed_raw.append(False)
+                    continue
+                exceeds = (emb_skip_threshold > 0 and vs_int > emb_skip_threshold)
+                if exceeds and self.seq_hash_size > 0:
+                    # Hash-rescue: small table; lookup applies (id-1) % H + 1
+                    # so id==0 stays as padding and the rest land in [1, H].
+                    embs_raw.append(nn.Embedding(self.seq_hash_size + 1,
+                                                 emb_dim, padding_idx=0))
+                    is_hashed_raw.append(True)
+                elif exceeds:
+                    embs_raw.append(None)
+                    is_hashed_raw.append(False)
                 else:
-                    embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                    embs_raw.append(nn.Embedding(vs_int + 1, emb_dim,
+                                                 padding_idx=0))
+                    is_hashed_raw.append(False)
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
             # Map from position index to real index in module_list (-1 if skipped)
             index_map = []
@@ -1352,21 +1439,23 @@ class PCVRHyFormer(nn.Module):
                 else:
                     index_map.append(-1)
             is_id = [int(vs) > seq_id_threshold for vs in vocab_sizes]
-            return module_list, index_map, is_id
+            return module_list, index_map, is_id, is_hashed_raw
 
         # ================== Dynamic Sequence Embeddings ==================
         self._seq_embs = nn.ModuleDict()
         self._seq_emb_index = {}    # domain -> index_map
         self._seq_is_id = {}        # domain -> is_id list
+        self._seq_is_hashed = {}    # domain -> hashed-flag list
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
 
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
-            embs, idx_map, is_id = _make_seq_embs(vs)
+            embs, idx_map, is_id, is_hashed = _make_seq_embs(vs)
             self._seq_embs[domain] = embs
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
+            self._seq_is_hashed[domain] = is_hashed
             self._seq_vocab_sizes[domain] = vs
             self._seq_proj[domain] = nn.Sequential(
                 nn.Linear(len(vs) * emb_dim, d_model),
@@ -1548,6 +1637,7 @@ class PCVRHyFormer(nn.Module):
         proj: nn.Module,
         is_id: List[bool],
         emb_index: List[int],
+        is_hashed: List[bool],
         time_bucket_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
@@ -1560,7 +1650,17 @@ class PCVRHyFormer(nn.Module):
                 emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
             else:
                 emb = sideinfo_embs[real_idx]
-                e = emb(seq[:, i, :])  # (B, L, emb_dim)
+                vals = seq[:, i, :]  # (B, L)
+                # Hash-rescue: keep id==0 as padding, hash other ids into
+                # [1, seq_hash_size]. ``seq_hash_size`` is guaranteed > 0
+                # whenever is_hashed[i] is True (see _make_seq_embs).
+                if i < len(is_hashed) and is_hashed[i]:
+                    vals = torch.where(
+                        vals > 0,
+                        ((vals - 1) % self.seq_hash_size + 1),
+                        vals,
+                    )
+                e = emb(vals)  # (B, L, emb_dim)
                 if is_id[i] and self.training:
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
@@ -1645,6 +1745,14 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.use_context_features:
+            cf = inputs.context_feats or {}
+            ctx_tok = self.context_tokenizer(
+                cf['ctx_hour'],
+                cf['ctx_item_in_c47'],
+                cf['ctx_null_pattern_99_103'],
+            )
+            ns_parts.append(ctx_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1656,6 +1764,7 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
+                self._seq_is_hashed[domain],
                 inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
@@ -1688,6 +1797,14 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.use_context_features:
+            cf = inputs.context_feats or {}
+            ctx_tok = self.context_tokenizer(
+                cf['ctx_hour'],
+                cf['ctx_item_in_c47'],
+                cf['ctx_null_pattern_99_103'],
+            )
+            ns_parts.append(ctx_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
@@ -1698,6 +1815,7 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
+                self._seq_is_hashed[domain],
                 inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
