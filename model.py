@@ -1229,6 +1229,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Pretrained user-embedding residual path. When `pretrained_dense_offsets`
+        # is non-empty, slices of `user_dense_feats` indexed by these (offset,
+        # length) tuples are routed through a dedicated non-linear adapter and
+        # added as residual to the pooled output before the classifier. Use
+        # this for SUM / LFM4Ads style pre-trained user embeddings (fid 61,
+        # 87 in this dataset).
+        use_pretrained_residual: bool = False,
+        pretrained_dense_offsets: Tuple[Tuple[int, int], ...] = (),
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1252,9 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        # Pretrained dense residual path
+        self.use_pretrained_residual = bool(use_pretrained_residual and pretrained_dense_offsets)
+        self.pretrained_dense_offsets = tuple((int(o), int(l)) for o, l in pretrained_dense_offsets)
 
         # ================== NS Tokens Construction ==================
 
@@ -1324,6 +1335,28 @@ class PCVRHyFormer(nn.Module):
                 f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
+
+        # ================== Pretrained Dense Adapter (residual to pooled output) ==================
+        # Per LFM4Ads paper: feature-level transfer of pretrained user
+        # embeddings should pass through a non-linear adapter before being
+        # consumed downstream. We project the slice of user_dense_feats
+        # corresponding to fid 61 (SUM, 256-d) and fid 87 (LFM4Ads, 320-d)
+        # through a small MLP and add as a residual to the pooled (B, D)
+        # output right before the classifier. This gives the pretrained
+        # embeddings a privileged shortcut path that bypasses the heavy
+        # transformer machinery.
+        if self.use_pretrained_residual:
+            pretrained_dim = sum(length for _, length in self.pretrained_dense_offsets)
+            adapter_hidden = d_model * 2
+            self.user_pretrained_adapter = nn.Sequential(
+                nn.Linear(pretrained_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-residual: {pretrained_dim}-d input "
+                f"(offsets={self.pretrained_dense_offsets}) -> {d_model}-d via 2-layer adapter")
 
         # ================== Seq Tokens Embedding ==================
         # seq_id_threshold decides which features inside the seq tokenizer are
@@ -1581,6 +1614,27 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _add_pretrained_residual(
+        self, output: torch.Tensor, user_dense_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """If enabled, slice pretrained user-embedding columns from
+        user_dense_feats, project via a non-linear adapter, and add as
+        residual to the pooled output.
+
+        Args:
+            output: (B, D) pooled representation right before the classifier.
+            user_dense_feats: (B, total_user_dense_dim) full dense vector.
+
+        Returns:
+            (B, D) tensor; identical to ``output`` if the residual path is off.
+        """
+        if not self.use_pretrained_residual:
+            return output
+        slices = [user_dense_feats[:, off:off + length]
+                  for off, length in self.pretrained_dense_offsets]
+        pretrained = torch.cat(slices, dim=-1)  # (B, sum_pretrained_dim)
+        return output + self.user_pretrained_adapter(pretrained)
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1670,6 +1724,9 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
+        # 4b. Add pretrained-dense residual (privileged shortcut path)
+        output = self._add_pretrained_residual(output, inputs.user_dense_feats)
+
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -1709,6 +1766,9 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        # Add pretrained-dense residual (privileged shortcut path)
+        output = self._add_pretrained_residual(output, inputs.user_dense_feats)
 
         logits = self.clsfier(output)
         return logits, output

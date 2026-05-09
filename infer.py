@@ -68,6 +68,14 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Pretrained-residual branch: route the user_dense slices for fids
+    # listed in ``pretrained_dense_fids`` (train_config.json) through a
+    # 2-layer adapter and add the result as a residual to the pooled
+    # output before the classifier. The bool below is read directly from
+    # train_config.json by ``_MODEL_CFG_KEYS``; the offsets tuple is
+    # injected later in ``main()`` after resolving fids against the schema.
+    'use_pretrained_residual': False,
+    'pretrained_dense_offsets': (),
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -78,6 +86,44 @@ _FALLBACK_NUM_WORKERS = 16
 # Hyperparameter keys used to build the model. Everything else in
 # ``train_config.json`` is ignored when constructing ``PCVRHyFormer``.
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
+
+
+def _resolve_pretrained_offsets(
+    pcvr_dataset: PCVRParquetDataset,
+    pretrained_dense_fids_str: str,
+) -> List[Tuple[int, int]]:
+    """Translate a comma-separated list of user_dense fids (e.g. ``"61,87"``)
+    into the corresponding ``(offset, length)`` slices inside the flat
+    ``user_dense_feats`` vector.
+
+    Mirrors the helper of the same name in ``train.py`` so that the eval-time
+    model is built with the exact same adapter input shape as the training-
+    time model. Unknown fids are silently skipped (the residual path becomes
+    a no-op for that fid) so that schema mismatches degrade gracefully.
+    """
+    if not pretrained_dense_fids_str:
+        return []
+    try:
+        fids = [int(x.strip()) for x in pretrained_dense_fids_str.split(',')
+                if x.strip()]
+    except ValueError:
+        logging.warning(f"Could not parse pretrained_dense_fids="
+                        f"{pretrained_dense_fids_str!r}, disabling residual")
+        return []
+    offsets: List[Tuple[int, int]] = []
+    schema = pcvr_dataset.user_dense_schema
+    for fid in fids:
+        if fid in schema._fid_to_entry:
+            offset, length = schema.get_offset_length(fid)
+            offsets.append((offset, length))
+        else:
+            logging.warning(f"pretrained_dense_fids={fid} not found in "
+                            f"user_dense_schema; skipping")
+    if offsets:
+        logging.info(f"Pretrained-dense offsets resolved: fids={fids} -> "
+                     f"slices={offsets} "
+                     f"(total {sum(l for _, l in offsets)} dim)")
+    return offsets
 
 
 def build_feature_specs(
@@ -346,6 +392,16 @@ def main() -> None:
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
+
+    # Pretrained-residual branch: train_config.json records the user-supplied
+    # fids as a comma-separated string (default "61,87"); resolve it against
+    # the dataset schema here to obtain the (offset, length) tuples expected
+    # by PCVRHyFormer. Empty / missing -> empty tuple, keeping this branch
+    # backward-compatible with non-residual checkpoints.
+    model_cfg['pretrained_dense_offsets'] = _resolve_pretrained_offsets(
+        test_dataset,
+        train_config.get('pretrained_dense_fids', ''),
+    )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the
