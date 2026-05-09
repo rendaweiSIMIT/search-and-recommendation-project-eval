@@ -68,6 +68,14 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Paper-faithful pretrained user-embedding paths (mixed branch).
+    # Defaults are empty: fallback path produces a no-op model that
+    # exactly matches an unmodified baseline checkpoint. Real values
+    # are injected later by ``_resolve_dense_fid_offsets`` from the
+    # ``additive_dense_fids`` / ``gating_dense_fids`` recorded in
+    # train_config.json.
+    'additive_dense_offsets': (),
+    'gating_dense_offsets': (),
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -78,6 +86,43 @@ _FALLBACK_NUM_WORKERS = 16
 # Hyperparameter keys used to build the model. Everything else in
 # ``train_config.json`` is ignored when constructing ``PCVRHyFormer``.
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
+
+
+def _resolve_dense_fid_offsets(
+    pcvr_dataset: PCVRParquetDataset,
+    fids_str: str,
+    label: str,
+) -> List[Tuple[int, int]]:
+    """Translate a comma-separated list of user_dense fids (e.g. ``"61"``)
+    into the corresponding ``(offset, length)`` slices inside the flat
+    ``user_dense_feats`` vector.
+
+    This mirrors the helper of the same name in ``train.py`` so that the
+    eval-time model is built with the exact same adapter shapes as the
+    training-time model. Unknown fids are silently skipped (the path
+    becomes a no-op for that fid) so that schema mismatches degrade
+    gracefully rather than crashing the eval container.
+    """
+    if not fids_str:
+        return []
+    try:
+        fids = [int(x.strip()) for x in fids_str.split(',') if x.strip()]
+    except ValueError:
+        logging.warning(f"Could not parse {label}={fids_str!r}, disabling path")
+        return []
+    offsets: List[Tuple[int, int]] = []
+    schema = pcvr_dataset.user_dense_schema
+    for fid in fids:
+        if fid in schema._fid_to_entry:
+            offset, length = schema.get_offset_length(fid)
+            offsets.append((offset, length))
+        else:
+            logging.warning(f"{label}={fid} not found in user_dense_schema; skipping")
+    if offsets:
+        logging.info(
+            f"{label} resolved: fids={fids} -> slices={offsets} "
+            f"(total {sum(l for _, l in offsets)} dim)")
+    return offsets
 
 
 def build_feature_specs(
@@ -346,6 +391,23 @@ def main() -> None:
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
+
+    # Paper-faithful pretrained-embedding adapters (mixed branch).
+    # train_config.json records the user-supplied fids as comma-separated
+    # strings (e.g. "61", "87"); we resolve them against the schema here
+    # to obtain the (offset, length) tuples expected by PCVRHyFormer.
+    # Empty / missing fields produce empty tuples, keeping this branch
+    # backward-compatible with non-mixed checkpoints.
+    model_cfg['additive_dense_offsets'] = _resolve_dense_fid_offsets(
+        test_dataset,
+        train_config.get('additive_dense_fids', ''),
+        '--additive_dense_fids',
+    )
+    model_cfg['gating_dense_offsets'] = _resolve_dense_fid_offsets(
+        test_dataset,
+        train_config.get('gating_dense_fids', ''),
+        '--gating_dense_fids',
+    )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the

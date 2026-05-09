@@ -1229,6 +1229,20 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Paper-faithful integration of pretrained user embeddings.
+        # The dataset README documents user_dense_feats_61 as Meta's SUM
+        # embedding and user_dense_feats_87 as Tencent's LFM4Ads embedding.
+        # Each paper validates a different downstream-integration recipe:
+        #   * SUM (Meta): treat as additional feature -> additive residual.
+        #   * LFM4Ads (Tencent): non-linear interaction (Eq 3-4) -> gating.
+        # We honor each paper for the slice it produced. Slices listed in
+        # `additive_dense_offsets` get an additive residual; slices in
+        # `gating_dense_offsets` get a multiplicative gate. Both paths
+        # operate on the pooled output right before the classifier:
+        #     output' = output * gate + residual
+        # Each path is parameterized by its own 2-layer adapter MLP.
+        additive_dense_offsets: Tuple[Tuple[int, int], ...] = (),
+        gating_dense_offsets: Tuple[Tuple[int, int], ...] = (),
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1258,13 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        # Paper-faithful pretrained dense paths
+        self.additive_dense_offsets = tuple(
+            (int(o), int(l)) for o, l in additive_dense_offsets)
+        self.gating_dense_offsets = tuple(
+            (int(o), int(l)) for o, l in gating_dense_offsets)
+        self.has_additive_dense = bool(self.additive_dense_offsets)
+        self.has_gating_dense = bool(self.gating_dense_offsets)
 
         # ================== NS Tokens Construction ==================
 
@@ -1324,6 +1345,33 @@ class PCVRHyFormer(nn.Module):
                 f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
+
+        # ================== Paper-Faithful Pretrained Adapters ==================
+        # Two independent 2-layer adapters: one for the additive (SUM) path
+        # and one for the gating (LFM4Ads) path. Either may be empty.
+        adapter_hidden = d_model * 2
+        if self.has_additive_dense:
+            additive_dim = sum(length for _, length in self.additive_dense_offsets)
+            self.user_additive_adapter = nn.Sequential(
+                nn.Linear(additive_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-additive (SUM-style): {additive_dim}-d "
+                f"(offsets={self.additive_dense_offsets}) -> {d_model}-d adapter")
+        if self.has_gating_dense:
+            gating_dim = sum(length for _, length in self.gating_dense_offsets)
+            self.user_gating_adapter = nn.Sequential(
+                nn.Linear(gating_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-gating (LFM4Ads-style): {gating_dim}-d "
+                f"(offsets={self.gating_dense_offsets}) -> {d_model}-d adapter")
 
         # ================== Seq Tokens Embedding ==================
         # seq_id_threshold decides which features inside the seq tokenizer are
@@ -1581,6 +1629,35 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _apply_pretrained_paths(
+        self, output: torch.Tensor, user_dense_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Combine SUM-style additive residual and LFM4Ads-style gating.
+
+            output' = output * gate + residual
+
+        where ``gate = 2*sigmoid(adapter_lfm(user_dense[gating_offsets]))``
+        and ``residual = adapter_sum(user_dense[additive_offsets])``.
+        Either path can be disabled (no-op) by passing empty offsets.
+        """
+        gate = None
+        residual = None
+        if self.has_gating_dense:
+            slices = [user_dense_feats[:, off:off + length]
+                      for off, length in self.gating_dense_offsets]
+            x = torch.cat(slices, dim=-1)  # (B, sum_lfm_dim)
+            gate = 2.0 * torch.sigmoid(self.user_gating_adapter(x))
+        if self.has_additive_dense:
+            slices = [user_dense_feats[:, off:off + length]
+                      for off, length in self.additive_dense_offsets]
+            x = torch.cat(slices, dim=-1)  # (B, sum_sum_dim)
+            residual = self.user_additive_adapter(x)
+        if gate is not None:
+            output = output * gate
+        if residual is not None:
+            output = output + residual
+        return output
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1670,6 +1747,9 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
+        # 4b. Paper-faithful pretrained-embedding paths
+        output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
+
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -1709,6 +1789,9 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        # Paper-faithful pretrained-embedding paths
+        output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
 
         logits = self.clsfier(output)
         return logits, output
