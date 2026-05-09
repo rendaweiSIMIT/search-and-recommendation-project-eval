@@ -570,6 +570,13 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- Synthesized context feature: hour-of-day ----
+        # Ad CTR/CVR has a strong diurnal pattern. The dataset spans 3.86
+        # days, so day-of-week is too sparse but each hour-of-day still
+        # appears 3-4 times -> learnable. Computed from the impression
+        # timestamp; the model only consumes it when use_hour=True.
+        hour_of_day = ((timestamps // 3600) % 24).astype(np.int64)
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
@@ -579,6 +586,7 @@ class PCVRParquetDataset(IterableDataset):
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
+            'ctx_hour': torch.from_numpy(hour_of_day),
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----

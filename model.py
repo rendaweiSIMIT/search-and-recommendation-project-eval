@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -16,6 +16,9 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Synthesized context features keyed by name; consumed only when the
+    # corresponding feature flag (e.g. use_hour) is on.
+    context_feats: Optional[Dict[str, torch.Tensor]] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1229,6 +1232,10 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Hour-of-day feature: when True, add one extra NS token derived
+        # from ctx_hour (0..23). To keep T = 16 under d_model = 64, run.sh
+        # reduces user_ns_tokens 5 -> 4.
+        use_hour: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1251,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_hour = bool(use_hour)
 
         # ================== NS Tokens Construction ==================
 
@@ -1311,9 +1319,19 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ================== Hour-of-day token (optional, +1 NS token) ==================
+        if self.use_hour:
+            self.hour_emb = nn.Embedding(24, d_model)
+            self.hour_proj = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info("Hour-of-day token enabled: ctx_hour -> 1 extra NS token")
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if self.use_hour else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1645,6 +1663,11 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.use_hour:
+            cf = inputs.context_feats or {}
+            h_emb = self.hour_emb(cf['ctx_hour'].long())
+            h_tok = F.silu(self.hour_proj(h_emb)).unsqueeze(1)
+            ns_parts.append(h_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1688,6 +1711,11 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.use_hour:
+            cf = inputs.context_feats or {}
+            h_emb = self.hour_emb(cf['ctx_hour'].long())
+            h_tok = F.silu(self.hour_proj(h_emb)).unsqueeze(1)
+            ns_parts.append(h_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
