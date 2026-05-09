@@ -570,6 +570,27 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- Synthesized context feature: item_in_c47 ----
+        # domain_c_seq_47 max=86.34M matches item_id max=86.55M, so
+        # c_seq_47 is almost certainly this user's item-id history.
+        # "User has seen this item before" is the canonical strong PCVR
+        # signal. Compute a (B,) bool per row; the model only consumes
+        # it when built with use_item_match=True.
+        item_in_c47 = np.zeros(B, dtype=np.int64)
+        if 'item_id' in self._col_idx and 'domain_c_seq_47' in self._col_idx:
+            item_id_arr = (batch.column(self._col_idx['item_id'])
+                                .fill_null(0)
+                                .to_numpy(zero_copy_only=False)
+                                .astype(np.int64))
+            c47_col = batch.column(self._col_idx['domain_c_seq_47'])
+            c47_offsets = c47_col.offsets.to_numpy()
+            c47_values = c47_col.values.to_numpy()
+            for i in range(B):
+                s = int(c47_offsets[i])
+                e = int(c47_offsets[i + 1])
+                if e > s and (c47_values[s:e] == item_id_arr[i]).any():
+                    item_in_c47[i] = 1
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
@@ -579,6 +600,7 @@ class PCVRParquetDataset(IterableDataset):
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
+            'ctx_item_in_c47': torch.from_numpy(item_in_c47),
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
