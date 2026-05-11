@@ -68,6 +68,13 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # mixed-extended: three pretrained-embedding adapter paths.
+    # Defaults are empty -> fallback build matches baseline.
+    'additive_dense_offsets': (),
+    'gating_dense_offsets': (),
+    'extra_additive_dense_offsets': (),
+    # Paired-pool restricted to raw-counter columns. Empty default = no-op.
+    'user_paired_pool_map': {},
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -78,6 +85,82 @@ _FALLBACK_NUM_WORKERS = 16
 # Hyperparameter keys used to build the model. Everything else in
 # ``train_config.json`` is ignored when constructing ``PCVRHyFormer``.
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
+
+
+def _resolve_dense_fid_offsets(
+    pcvr_dataset: PCVRParquetDataset,
+    fids_str: str,
+    label: str,
+) -> List[Tuple[int, int]]:
+    """Translate a comma-separated list of user_dense fids (e.g. "61")
+    into the corresponding ``(offset, length)`` slices.
+
+    Mirrors the helper of the same name in ``train.py`` so the eval-time
+    model is built with the same adapter shapes as training.
+    """
+    if not fids_str:
+        return []
+    try:
+        fids = [int(x.strip()) for x in fids_str.split(',') if x.strip()]
+    except ValueError:
+        logging.warning(f"Could not parse {label}={fids_str!r}, disabling path")
+        return []
+    offsets: List[Tuple[int, int]] = []
+    schema = pcvr_dataset.user_dense_schema
+    for fid in fids:
+        if fid in schema._fid_to_entry:
+            offset, length = schema.get_offset_length(fid)
+            offsets.append((offset, length))
+        else:
+            logging.warning(f"{label}={fid} not found in user_dense_schema; skipping")
+    if offsets:
+        logging.info(
+            f"{label} resolved: fids={fids} -> slices={offsets} "
+            f"(total {sum(l for _, l in offsets)} dim)")
+    return offsets
+
+
+def _resolve_paired_pool_map(
+    pcvr_dataset: PCVRParquetDataset,
+    paired_pool_fids_str: str,
+) -> Dict[int, Tuple[int, int]]:
+    """Translate paired_pool_fids string into the int_idx -> (dense_off,
+    dense_len) map used by RankMixerNSTokenizer. Mirrors train.py.
+    """
+    if not paired_pool_fids_str:
+        return {}
+    try:
+        fids = [int(x.strip()) for x in paired_pool_fids_str.split(',') if x.strip()]
+    except ValueError:
+        logging.warning(f"Could not parse paired_pool_fids="
+                        f"{paired_pool_fids_str!r}, disabling")
+        return {}
+    int_schema = pcvr_dataset.user_int_schema
+    dense_schema = pcvr_dataset.user_dense_schema
+    int_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(int_schema.entries)}
+
+    paired_map: Dict[int, Tuple[int, int]] = {}
+    for fid in fids:
+        if fid not in int_fid_to_idx:
+            logging.warning(f"paired_pool_fids={fid} not in user_int_schema; skipping")
+            continue
+        if fid not in dense_schema._fid_to_entry:
+            logging.warning(f"paired_pool_fids={fid} not in user_dense_schema; skipping")
+            continue
+        int_idx = int_fid_to_idx[fid]
+        _, _, int_len = int_schema.entries[int_idx]
+        d_off, d_len = dense_schema.get_offset_length(fid)
+        if int_len != d_len:
+            logging.warning(
+                f"paired_pool_fids={fid}: int_len={int_len} != dense_len={d_len}, "
+                f"alignment broken; skipping")
+            continue
+        paired_map[int_idx] = (d_off, d_len)
+    if paired_map:
+        logging.info(
+            f"Paired pool resolved: requested fids={fids} "
+            f"(int_idx -> dense slice): {sorted(paired_map.items())}")
+    return paired_map
 
 
 def build_feature_specs(
@@ -346,6 +429,31 @@ def main() -> None:
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
+
+    # mixed-extended branch: train_config.json records the user-supplied
+    # fids as comma-separated strings; resolve them against the dataset
+    # schema so the eval-time model reconstructs the exact same adapter /
+    # paired-pool topology that was active during training. Empty / missing
+    # values produce empty containers (path becomes a no-op).
+    model_cfg['additive_dense_offsets'] = _resolve_dense_fid_offsets(
+        test_dataset,
+        train_config.get('additive_dense_fids', ''),
+        '--additive_dense_fids',
+    )
+    model_cfg['gating_dense_offsets'] = _resolve_dense_fid_offsets(
+        test_dataset,
+        train_config.get('gating_dense_fids', ''),
+        '--gating_dense_fids',
+    )
+    model_cfg['extra_additive_dense_offsets'] = _resolve_dense_fid_offsets(
+        test_dataset,
+        train_config.get('extra_additive_dense_fids', ''),
+        '--extra_additive_dense_fids',
+    )
+    model_cfg['user_paired_pool_map'] = _resolve_paired_pool_map(
+        test_dataset,
+        train_config.get('paired_pool_fids', ''),
+    )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the

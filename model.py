@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -1083,6 +1083,7 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        paired_pool_map: Optional[Dict[int, Tuple[int, int]]] = None,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1093,6 +1094,10 @@ class RankMixerNSTokenizer(nn.Module):
             d_model: Output token dimension.
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            paired_pool_map: Optional dict mapping feature_specs index ->
+                (dense_offset, dense_length). When set, the multi-value lookup
+                for that fid uses ``softmax(signed_log1p(dense_slice))`` as
+                per-position weights instead of mean pooling.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1100,6 +1105,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.paired_pool_map: Dict[int, Tuple[int, int]] = dict(paired_pool_map or {})
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1144,12 +1150,25 @@ class RankMixerNSTokenizer(nn.Module):
             f"total_emb_dim={total_emb_dim}, chunk_dim={self.chunk_dim}, "
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
+        if self.paired_pool_map:
+            logging.info(
+                f"RankMixerNSTokenizer: paired pooling enabled for "
+                f"{len(self.paired_pool_map)} fid(s) "
+                f"(int_idx -> dense_slice): {sorted(self.paired_pool_map.items())}"
+            )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            dense_feats: (B, total_dense_dim) concatenated dense features.
+                Only consulted for fids in ``paired_pool_map``; None falls
+                back to baseline mean pool.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1169,9 +1188,24 @@ class RankMixerNSTokenizer(nn.Module):
                     else:
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        if (dense_feats is not None
+                                and fid_idx in self.paired_pool_map):
+                            # Paired pool: softmax(signed_log1p(dense_slice))
+                            # over the seq dimension; padding (id==0) masked to
+                            # -inf so it contributes 0 weight; all-padding rows
+                            # collapse softmax to NaN, replaced with 0.
+                            d_off, d_len = self.paired_pool_map[fid_idx]
+                            weights = dense_feats[:, d_off:d_off + d_len]
+                            pad_mask = (vals == 0)
+                            logits = torch.sign(weights) * torch.log1p(torch.abs(weights))
+                            logits = logits.masked_fill(pad_mask, float('-inf'))
+                            attn = F.softmax(logits, dim=-1)
+                            attn = torch.nan_to_num(attn, nan=0.0)
+                            fid_emb = (emb_all * attn.unsqueeze(-1)).sum(dim=1)
+                        else:
+                            mask = (vals != 0).float().unsqueeze(-1)
+                            count = mask.sum(dim=1).clamp(min=1)
+                            fid_emb = (emb_all * mask).sum(dim=1) / count
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1229,6 +1263,23 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Paper-faithful pretrained-embedding integration (mixed branch).
+        # fid 61 = Meta SUM (256-d user embedding) -> additive residual.
+        # fid 87 = Tencent LFM4Ads (320-d user representation) -> gating.
+        additive_dense_offsets: Tuple[Tuple[int, int], ...] = (),
+        gating_dense_offsets: Tuple[Tuple[int, int], ...] = (),
+        # NEW: extra additive adapter for fid 89-91 (3 sets of 10-dim
+        # per-category affinity scores). These look like a smaller third
+        # pretrained source — same SUM-style additive integration as fid 61.
+        # Kept as a SEPARATE adapter from fid 61's so the two pretrained
+        # sources don't have to share an MLP basis.
+        extra_additive_dense_offsets: Tuple[Tuple[int, int], ...] = (),
+        # Paired-pool: positional indices into ``user_int_feature_specs``
+        # that should pool with softmax(signed_log1p(dense)) weights.
+        # In this branch restricted to raw-counter columns 62-66; the
+        # in-[-1,1] 89-91 columns are routed through the extra additive
+        # adapter above instead.
+        user_paired_pool_map: Optional[Dict[int, Tuple[int, int]]] = None,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1295,20 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        # Pretrained-embedding adapter offsets (all normalized to int tuples)
+        self.additive_dense_offsets = tuple(
+            (int(o), int(l)) for o, l in additive_dense_offsets)
+        self.gating_dense_offsets = tuple(
+            (int(o), int(l)) for o, l in gating_dense_offsets)
+        self.extra_additive_dense_offsets = tuple(
+            (int(o), int(l)) for o, l in extra_additive_dense_offsets)
+        self.has_additive_dense = bool(self.additive_dense_offsets)
+        self.has_gating_dense = bool(self.gating_dense_offsets)
+        self.has_extra_additive_dense = bool(self.extra_additive_dense_offsets)
+        # Paired-pool map (for forward() to know whether to thread user_dense
+        # through the user-side tokenizer).
+        self.user_paired_pool_map: Dict[int, Tuple[int, int]] = dict(
+            user_paired_pool_map or {})
 
         # ================== NS Tokens Construction ==================
 
@@ -1280,6 +1345,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                paired_pool_map=self.user_paired_pool_map,
             )
             num_user_ns = user_ns_tokens
 
@@ -1324,6 +1390,56 @@ class PCVRHyFormer(nn.Module):
                 f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
+
+        # ================== Pretrained-Embedding Adapters ==================
+        # Three independent 2-layer adapters operating on slices of
+        # ``user_dense_feats``. Each can be empty (path becomes a no-op).
+        #
+        #   additive_adapter        ── fid 61 (Meta SUM)        residual_61
+        #   gating_adapter          ── fid 87 (Tencent LFM4Ads) gate_87
+        #   extra_additive_adapter  ── fid 89..91 (NEW)         residual_89_91
+        #
+        # Applied right before the classifier as:
+        #     output' = output * gate_87 + residual_61 + residual_89_91
+        # so each adapter has a privileged shortcut path that bypasses the
+        # heavy transformer machinery. Zero offsets keep the path inert.
+        adapter_hidden = d_model * 2
+        if self.has_additive_dense:
+            additive_dim = sum(length for _, length in self.additive_dense_offsets)
+            self.user_additive_adapter = nn.Sequential(
+                nn.Linear(additive_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-additive (SUM-style): {additive_dim}-d "
+                f"(offsets={self.additive_dense_offsets}) -> {d_model}-d adapter")
+        if self.has_gating_dense:
+            gating_dim = sum(length for _, length in self.gating_dense_offsets)
+            self.user_gating_adapter = nn.Sequential(
+                nn.Linear(gating_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-gating (LFM4Ads-style): {gating_dim}-d "
+                f"(offsets={self.gating_dense_offsets}) -> {d_model}-d adapter")
+        if self.has_extra_additive_dense:
+            extra_dim = sum(length for _, length in self.extra_additive_dense_offsets)
+            # NEW: dedicated adapter for fid 89-91. Keep hidden the same so
+            # the path has comparable capacity to fid 61's even though its
+            # input is much smaller.
+            self.user_extra_additive_adapter = nn.Sequential(
+                nn.Linear(extra_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-extra-additive (89/90/91): {extra_dim}-d "
+                f"(offsets={self.extra_additive_dense_offsets}) -> {d_model}-d adapter")
 
         # ================== Seq Tokens Embedding ==================
         # seq_id_threshold decides which features inside the seq tokenizer are
@@ -1581,6 +1697,43 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _apply_pretrained_paths(
+        self, output: torch.Tensor, user_dense_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Combine three pretrained-embedding paths into the pooled output:
+
+            output' = output * gate_87 + residual_61 + residual_89_91
+
+        where ``gate_87 = 2*sigmoid(adapter_lfm(user_dense[gating_offsets]))``,
+        ``residual_61 = adapter_sum(user_dense[additive_offsets])``,
+        ``residual_89_91 = adapter_extra(user_dense[extra_additive_offsets])``.
+
+        Any path can be disabled (no-op) by passing empty offsets.
+        """
+        gate = None
+        residual = None
+        if self.has_gating_dense:
+            slices = [user_dense_feats[:, off:off + length]
+                      for off, length in self.gating_dense_offsets]
+            x = torch.cat(slices, dim=-1)
+            gate = 2.0 * torch.sigmoid(self.user_gating_adapter(x))
+        if self.has_additive_dense:
+            slices = [user_dense_feats[:, off:off + length]
+                      for off, length in self.additive_dense_offsets]
+            x = torch.cat(slices, dim=-1)
+            residual = self.user_additive_adapter(x)
+        if self.has_extra_additive_dense:
+            slices = [user_dense_feats[:, off:off + length]
+                      for off, length in self.extra_additive_dense_offsets]
+            x = torch.cat(slices, dim=-1)
+            extra = self.user_extra_additive_adapter(x)
+            residual = extra if residual is None else (residual + extra)
+        if gate is not None:
+            output = output * gate
+        if residual is not None:
+            output = output + residual
+        return output
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1633,8 +1786,13 @@ class PCVRHyFormer(nn.Module):
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
+        # 1. NS tokens: grouped projection. user_dense_feats is forwarded
+        #    so paired-pool fids can replace mean pool with softmax-weighted
+        #    pool over the aligned dense slice.
+        user_dense_for_pool = (inputs.user_dense_feats
+                               if self.user_paired_pool_map else None)
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats,
+                                         user_dense_for_pool)     # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
@@ -1670,6 +1828,10 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
+        # 4b. Three pretrained-embedding paths (fid 61 additive + fid 87
+        #     gating + fid 89-91 additive). Privileged shortcut to output.
+        output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
+
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -1677,7 +1839,10 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        user_dense_for_pool = (inputs.user_dense_feats
+                               if self.user_paired_pool_map else None)
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats,
+                                         user_dense_for_pool)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
@@ -1709,6 +1874,9 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        # Three pretrained-embedding paths.
+        output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
 
         logits = self.clsfier(output)
         return logits, output
