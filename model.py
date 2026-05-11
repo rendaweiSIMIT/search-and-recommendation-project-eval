@@ -1189,6 +1189,134 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class CrossArchSummarizer(nn.Module):
+    """InterFormer-style sequence-to-non-sequence (s2n) feedback module.
+
+    Captures the missing direction of information flow in the baseline
+    architecture: while the baseline's MultiSeqQueryGenerator already
+    flows non-sequence info INTO seq learning (via mixed-query
+    cross-attention), there is NO path back from seq to non-sequence.
+    InterFormer (Meta CIKM 2025) demonstrates that this bidirectional
+    flow is consistently better than either direction alone.
+
+    Per domain, we produce TWO summary vectors from the EVOLVED seq
+    tokens (i.e., after all HyFormer blocks have processed them):
+
+      * CLS-pooled  : a learnable query per domain attends over the
+                       evolved seq via CrossAttention. The query is
+                       learned, so the model picks "what to summarize".
+      * Recent-K    : mean of the K most-recent valid positions
+                       (sequences are guaranteed descending-sorted by
+                       timestamp in this dataset, so positions [0, K)
+                       are the freshest interactions; the seq mask
+                       handles users with fewer than K events).
+
+    Concat across {2 summaries x num_domains} -> selective gated
+    projection -> (B, d_model). This vector is added as a RESIDUAL to
+    the pooled output before the classifier, so the model can learn
+    weight 0 if the s2n path is useless (downside-bounded).
+
+    Total params ≈ num_domains*(CrossAttention_params + d_model)
+                  + MLP(2*nD*d_model, 2*d_model)
+                  + Linear(d_model, d_model) + LN.
+    With num_domains=4, num_heads=4, d_model=64: ~100K params.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_domains: int,
+        num_heads: int = 4,
+        recent_k: int = 8,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_domains = num_domains
+        self.recent_k = recent_k
+        self.d_model = d_model
+
+        # Per-domain CLS queries -- one learnable token per domain so
+        # different domains can decide on different summarization criteria.
+        self.cls_queries = nn.ParameterList([
+            nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+            for _ in range(num_domains)
+        ])
+        # Per-domain CrossAttention that attends from CLS query to seq.
+        self.cls_attns = nn.ModuleList([
+            CrossAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                ln_mode='pre',
+            )
+            for _ in range(num_domains)
+        ])
+
+        # Summary dim: 2 summaries (CLS + recent-K mean) per domain.
+        summary_dim = 2 * num_domains * d_model
+        # 2-layer MLP for selective summarization (a la InterFormer's
+        # Cross Arch "gated MLP for non-seq summary").
+        self.summary_mlp = nn.Sequential(
+            nn.Linear(summary_dim, 2 * d_model),
+            nn.SiLU(),
+            nn.Linear(2 * d_model, d_model),
+        )
+        # Self-gating: sigmoid(g(x)) * x -- in InterFormer this is the
+        # Gating(...) operation that filters out noise before exchange.
+        self.gate = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        seq_tokens_list: List[torch.Tensor],
+        seq_masks_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            seq_tokens_list: list of (B, L_i, D) tensors -- evolved seq
+                tokens after HyFormer blocks. May vary in L_i across
+                domains (e.g., longer encoder compresses to top_k).
+            seq_masks_list: list of (B, L_i) bool masks. True = padding.
+
+        Returns:
+            (B, D) residual vector to be added to pooled output.
+        """
+        per_domain = []
+        for i in range(self.num_domains):
+            seq_t = seq_tokens_list[i]                       # (B, L, D)
+            seq_m = seq_masks_list[i]                        # (B, L)
+            B = seq_t.shape[0]
+            L = seq_t.shape[1]
+
+            # --- CLS pooling: learnable query cross-attends over seq ---
+            cls_q = self.cls_queries[i].expand(B, -1, -1)    # (B, 1, D)
+            cls_pooled = self.cls_attns[i](
+                query=cls_q,
+                key_value=seq_t,
+                key_padding_mask=seq_m,
+                rope_cos=None,
+                rope_sin=None,
+            ).squeeze(1)                                     # (B, D)
+
+            # --- Recent-K pooling: mean of last K valid positions ---
+            K = min(self.recent_k, L)
+            recent_seq = seq_t[:, :K, :]                     # (B, K, D)
+            recent_valid = (~seq_m[:, :K]).float().unsqueeze(-1)  # (B, K, 1)
+            recent_sum = (recent_seq * recent_valid).sum(dim=1)   # (B, D)
+            recent_count = recent_valid.sum(dim=1).clamp(min=1)   # (B, 1)
+            recent_pooled = recent_sum / recent_count        # (B, D)
+
+            per_domain.append(cls_pooled)
+            per_domain.append(recent_pooled)
+
+        # (B, 2 * num_domains * D) flat summary.
+        concat = torch.cat(per_domain, dim=-1)
+        # MLP-projected summary, then self-gated and normalized.
+        proj = self.summary_mlp(concat)                      # (B, D)
+        proj = proj * torch.sigmoid(self.gate(proj))         # gating
+        return self.norm(proj)                               # (B, D)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1357,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # InterFormer-style seq -> non-seq Cross Arch feedback. When True,
+        # the model adds a CrossArchSummarizer that pools each domain's
+        # evolved seq via (CLS-attention + recent-K mean), projects across
+        # domains, and adds the result as a residual to the pooled output
+        # before the classifier. This injects the s2n information flow
+        # the baseline architecture is missing.
+        use_cross_arch: bool = False,
+        cross_arch_recent_k: int = 8,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1380,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_cross_arch = bool(use_cross_arch)
+        self.cross_arch_recent_k = int(cross_arch_recent_k)
 
         # ================== NS Tokens Construction ==================
 
@@ -1404,6 +1542,23 @@ class PCVRHyFormer(nn.Module):
             )
             for _ in range(num_hyformer_blocks)
         ])
+
+        # ================== Cross Arch (optional, InterFormer s2n feedback) ==================
+        # Built only when enabled. Consumes the evolved seq tokens emitted
+        # by the HyFormer block stack (see modified _run_multi_seq_blocks
+        # below) and contributes a (B, d_model) residual to the pooled
+        # output. Zero impact on T or state_dict layout otherwise.
+        if self.use_cross_arch:
+            self.cross_arch = CrossArchSummarizer(
+                d_model=d_model,
+                num_domains=self.num_sequences,
+                num_heads=num_heads,
+                recent_k=self.cross_arch_recent_k,
+                dropout=dropout_rate,
+            )
+            logging.info(
+                f"Cross Arch enabled: per-domain (CLS-attn + recent-{self.cross_arch_recent_k} "
+                f"mean) summary -> {d_model}-d residual to pooled output")
 
         # ================== RoPE ==================
         if use_rope:
@@ -1587,9 +1742,15 @@ class PCVRHyFormer(nn.Module):
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
-        apply_dropout: bool = True
-    ) -> torch.Tensor:
-        """Runs the multi-sequence block stack with dropout and output projection."""
+        apply_dropout: bool = True,
+        return_evolved_seqs: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, list]]:
+        """Runs the multi-sequence block stack with dropout and output projection.
+
+        When ``return_evolved_seqs=True``, also returns the post-HyFormer seq
+        tokens and their padding masks (used by the Cross Arch path to
+        produce s2n feedback summarization).
+        """
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
@@ -1629,6 +1790,8 @@ class PCVRHyFormer(nn.Module):
         output = all_q.view(B, -1)  # (B, Nq*S*D)
         output = self.output_proj(output)  # (B, D)
 
+        if return_evolved_seqs:
+            return output, curr_seqs, curr_masks
         return output
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
@@ -1664,11 +1827,23 @@ class PCVRHyFormer(nn.Module):
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
-        )
+        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection.
+        #    When Cross Arch is enabled, also fetch the EVOLVED seq tokens
+        #    (post-HyFormer-block) so we can summarize them into an s2n
+        #    residual feedback signal.
+        if self.use_cross_arch:
+            output, evolved_seqs, evolved_masks = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=self.training,
+                return_evolved_seqs=True,
+            )
+            # 4b. Seq -> NS feedback via CrossArchSummarizer residual.
+            output = output + self.cross_arch(evolved_seqs, evolved_masks)
+        else:
+            output = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=self.training,
+            )
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1705,10 +1880,18 @@ class PCVRHyFormer(nn.Module):
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
-        )
+        if self.use_cross_arch:
+            output, evolved_seqs, evolved_masks = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=False,
+                return_evolved_seqs=True,
+            )
+            output = output + self.cross_arch(evolved_seqs, evolved_masks)
+        else:
+            output = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=False,
+            )
 
         logits = self.clsfier(output)
         return logits, output
