@@ -1229,6 +1229,16 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # DIN-style item-aware cross-attention. When True, the item-side NS
+        # tokens are used as queries to cross-attend over each user-history
+        # sequence; the pooled outputs across the 4 domains are concatenated,
+        # projected, and ADDED as a residual to the pooled output right
+        # before the classifier. This injects the strong DIN inductive bias
+        # ("score the candidate item against each historical action") that
+        # the existing model can only approximate through its mixed-NS
+        # queries. Pure additive residual -> when the projection learns
+        # weight 0 the model recovers baseline behavior.
+        use_din_attention: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1315,6 +1325,13 @@ class PCVRHyFormer(nn.Module):
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
+        # Position split inside ns_tokens for DIN attention slicing.
+        # Layout: [user_ns(num_user_ns) | user_dense_tok(0/1) | item_ns(num_item_ns) | item_dense_tok(0/1)]
+        # Item-side starts after the user block.
+        self.num_user_ns_total = num_user_ns + (1 if self.has_user_dense else 0)
+        self.num_item_ns_total = num_item_ns + (1 if self.has_item_dense else 0)
+        self.use_din_attention = bool(use_din_attention)
+
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
         if rank_mixer_mode == 'full' and d_model % T != 0:
@@ -1324,6 +1341,38 @@ class PCVRHyFormer(nn.Module):
                 f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
+
+        # ================== DIN-style item-aware cross-attention ==================
+        # One CrossAttention head per sequence domain. Each takes the
+        # item-side NS tokens (item_ns_full has num_item_ns_total tokens)
+        # as queries and the raw sequence tokens for that domain as
+        # keys/values. The pooled output across domains is projected and
+        # added as a residual to the pooled output before the classifier.
+        #
+        # Why "raw" seq tokens (not the HyFormer-evolved ones): DIN's
+        # canonical formulation matches the candidate item against the
+        # user's UNFILTERED history; evolving them through HyFormer first
+        # would already bake in mixed user+item context, diluting the
+        # DIN-specific inductive bias.
+        if self.use_din_attention:
+            self.din_cross_attns = nn.ModuleList([
+                CrossAttention(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    dropout=dropout_rate,
+                    ln_mode='pre',
+                )
+                for _ in range(self.num_sequences)
+            ])
+            # Pool across domains: concat 4 per-domain (B, D) -> project to D
+            self.din_proj = nn.Sequential(
+                nn.Linear(self.num_sequences * d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"DIN-style attention enabled: {self.num_item_ns_total} item-side "
+                f"NS tokens as queries over {self.num_sequences} domain seqs "
+                f"-> {d_model}-d residual to pooled output")
 
         # ================== Seq Tokens Embedding ==================
         # seq_id_threshold decides which features inside the seq tokenizer are
@@ -1581,6 +1630,45 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _apply_din_attention(
+        self,
+        ns_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_masks_list: list,
+    ) -> torch.Tensor:
+        """Run DIN-style item-aware cross-attention.
+
+        For each of ``self.num_sequences`` domains, the item-side slice of
+        ``ns_tokens`` (shape (B, num_item_ns_total, D)) is used as query
+        against that domain's raw sequence tokens. The cross-attended
+        output is mean-pooled over the query dim to get a single (B, D)
+        item-aware user representation per domain, concatenated across
+        domains, and projected back to (B, D) via ``din_proj``.
+
+        Returns the (B, D) residual to be ADDED to the pooled output.
+        """
+        # Slice item-side portion of ns_tokens.
+        item_ns = ns_tokens[:, self.num_user_ns_total:, :]   # (B, num_item_ns_total, D)
+        per_domain = []
+        for i in range(self.num_sequences):
+            seq_t = seq_tokens_list[i]                       # (B, L_i, D)
+            seq_m = seq_masks_list[i]                        # (B, L_i) bool, True=pad
+            # CrossAttention applies Pre-LN to both query and KV internally
+            # and returns (B, num_item_ns_total, D). No RoPE here because
+            # item_ns is positionless.
+            attn_out = self.din_cross_attns[i](
+                query=item_ns,
+                key_value=seq_t,
+                key_padding_mask=seq_m,
+                rope_cos=None,
+                rope_sin=None,
+            )                                                # (B, num_item_ns_total, D)
+            # Mean-pool across query dim to get per-domain item-aware vec.
+            per_domain.append(attn_out.mean(dim=1))          # (B, D)
+
+        # (B, num_sequences * D) -> (B, D)
+        return self.din_proj(torch.cat(per_domain, dim=-1))
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1670,6 +1758,14 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
+        # 4b. DIN-style item-aware attention. Uses the RAW seq_tokens_list
+        # (pre-HyFormer-evolution) so the DIN signal stays "candidate item
+        # against unfiltered user history". Adds a residual to the pooled
+        # output -- the projection learns to weight 0 if useless.
+        if self.use_din_attention:
+            output = output + self._apply_din_attention(
+                ns_tokens, seq_tokens_list, seq_masks_list)
+
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -1709,6 +1805,11 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        # DIN-style item-aware attention residual.
+        if self.use_din_attention:
+            output = output + self._apply_din_attention(
+                ns_tokens, seq_tokens_list, seq_masks_list)
 
         logits = self.clsfier(output)
         return logits, output
