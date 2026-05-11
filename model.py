@@ -1189,6 +1189,194 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class OneTransSuffixBlock(nn.Module):
+    """OneTrans-lite block as a post-HyFormer NS-enrichment head.
+
+    Adapted from OneTrans (ByteDance WWW 2026): unifies sequential and
+    non-sequential tokens into one causal Transformer block with
+    "mixed parameterization". Used here as a SINGLE post-block enrichment
+    head (not a full unified backbone, which would require replacing the
+    whole PCVRHyFormer architecture).
+
+    Mixed parameterization
+    ----------------------
+    The OneTrans paper's key insight is that S-tokens (events in a
+    sequence) are HOMOGENEOUS -- same kind of signal at different
+    positions -- so they should share QKV/FFN weights, while NS-tokens
+    each represent a DIFFERENT semantic source (user profile, item
+    profile, context, dense pretrained emb, ...) and therefore deserve
+    PER-TOKEN parameters.
+
+    Causal pyramid attention
+    ------------------------
+    To keep compute bounded under our 4-domain ~1.5K-token sequences,
+    we use the "max pyramid" configuration: only NS tokens issue
+    queries. K/V come from the full [S | NS] concatenation. So:
+        * Q: (B, n_ns, D)            -- only NS positions
+        * K, V: (B, L_total, D)      -- full S + NS
+        * Mask shape: (n_ns, L_total) -- NS_i can see all S + NS[:i+1]
+
+    This means S tokens are NOT updated by this block; only NS tokens
+    are enriched. That's intentional: the baseline's HyFormer blocks
+    already evolve S tokens; this head's role is the s2n information
+    flow OneTrans argues is missing in the conventional pipeline.
+
+    Output usage
+    ------------
+    Returns the enriched NS tokens (B, n_ns, D). The caller pools them
+    (concat -> linear -> LN) into a (B, D) residual added to the pooled
+    output before the classifier -- so OneTrans suffix is downside-
+    bounded (model can learn the pool projection to 0 if useless).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_ns_tokens: int,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        assert d_model % num_heads == 0, \
+            f"d_model={d_model} must divide num_heads={num_heads}"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.num_ns = num_ns_tokens
+
+        # ---- Pre-norms (one shared for S-tokens, per-token for NS) ----
+        self.s_attn_norm = nn.LayerNorm(d_model)
+        self.ns_attn_norm = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_ns_tokens)
+        ])
+        self.ns_ffn_norm = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_ns_tokens)
+        ])
+
+        # ---- Attention projections ----
+        # S-side: SHARED K/V projection (no Q needed since S doesn't
+        # issue queries in the pyramid).
+        self.s_kv = nn.Linear(d_model, 2 * d_model)
+        # NS-side: PER-TOKEN QKV projection (mixed parameterization).
+        self.ns_qkv = nn.ModuleList([
+            nn.Linear(d_model, 3 * d_model)
+            for _ in range(num_ns_tokens)
+        ])
+        # Output projection (shared, applied uniformly across NS positions).
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # ---- Per-NS-token FFN ("mixed FFN" -- token-specific) ----
+        ffn_hidden = d_model * hidden_mult
+        self.ns_ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, ffn_hidden),
+                nn.GELU(),
+                nn.Linear(ffn_hidden, d_model),
+            )
+            for _ in range(num_ns_tokens)
+        ])
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        seq_tokens_list: List[torch.Tensor],
+        seq_masks_list: List[torch.Tensor],
+        ns_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the OneTrans-suffix attention + FFN, updating NS only.
+
+        Args:
+            seq_tokens_list: list of (B, L_i, D) evolved seq tokens per domain.
+            seq_masks_list:  list of (B, L_i) bool padding masks (True=pad).
+            ns_tokens:       (B, num_ns, D) evolved NS tokens.
+
+        Returns:
+            (B, num_ns, D) updated NS tokens.
+        """
+        B = ns_tokens.shape[0]
+        L_ns = ns_tokens.shape[1]
+        device = ns_tokens.device
+
+        # 1. Concat S tokens across all domains.
+        s_tokens = torch.cat(seq_tokens_list, dim=1)         # (B, L_s, D)
+        s_pad_mask = torch.cat(seq_masks_list, dim=1)        # (B, L_s) True=pad
+        L_s = s_tokens.shape[1]
+
+        # 2. Pre-norm (S shared, NS per-token).
+        s_normed = self.s_attn_norm(s_tokens)
+        ns_norm_list = [self.ns_attn_norm[i](ns_tokens[:, i, :])
+                        for i in range(L_ns)]
+        ns_normed = torch.stack(ns_norm_list, dim=1)         # (B, num_ns, D)
+
+        # 3. Compute K/V for S (shared), Q/K/V for NS (per-token).
+        s_kv = self.s_kv(s_normed)                           # (B, L_s, 2D)
+        s_k, s_v = s_kv.chunk(2, dim=-1)                     # each (B, L_s, D)
+
+        ns_q_list, ns_k_list, ns_v_list = [], [], []
+        for i in range(L_ns):
+            qkv = self.ns_qkv[i](ns_normed[:, i, :])         # (B, 3D)
+            q_i, k_i, v_i = qkv.chunk(3, dim=-1)             # each (B, D)
+            ns_q_list.append(q_i)
+            ns_k_list.append(k_i)
+            ns_v_list.append(v_i)
+        ns_q = torch.stack(ns_q_list, dim=1)                 # (B, num_ns, D)
+        ns_k = torch.stack(ns_k_list, dim=1)
+        ns_v = torch.stack(ns_v_list, dim=1)
+
+        # 4. Concat K/V along sequence: S then NS.
+        all_k = torch.cat([s_k, ns_k], dim=1)                # (B, L_s+L_ns, D)
+        all_v = torch.cat([s_v, ns_v], dim=1)
+
+        # 5. Reshape for multi-head: (B, h, L, head_dim).
+        ns_q_h = ns_q.view(B, L_ns, self.num_heads, self.head_dim).transpose(1, 2)
+        all_k_h = all_k.view(B, L_s + L_ns, self.num_heads, self.head_dim).transpose(1, 2)
+        all_v_h = all_v.view(B, L_s + L_ns, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 6. Build (L_ns, L_s + L_ns) mask: True = block out.
+        # NS_i attends to all S + NS[0..i] (causal among NS positions).
+        s_block = torch.zeros(L_ns, L_s, dtype=torch.bool, device=device)
+        ns_causal = torch.triu(
+            torch.ones(L_ns, L_ns, dtype=torch.bool, device=device),
+            diagonal=1,
+        )                                                    # j > i -> True (block)
+        attn_block_2d = torch.cat([s_block, ns_causal], dim=1)  # (L_ns, L_s+L_ns)
+
+        # Combine with per-batch padding mask on S side.
+        ns_pad_mask = torch.zeros(B, L_ns, dtype=torch.bool, device=device)
+        full_pad = torch.cat([s_pad_mask, ns_pad_mask], dim=1)  # (B, L_s+L_ns)
+        combined_block = attn_block_2d.unsqueeze(0) | full_pad.unsqueeze(1)
+        # Broadcast to heads: (B, 1, L_ns, L_s+L_ns).
+        combined_block = combined_block.unsqueeze(1)
+        # SDPA expects True = attend, so negate.
+        attend_mask = ~combined_block
+
+        # 7. Scaled dot-product attention (only NS positions get outputs).
+        attn_out = F.scaled_dot_product_attention(
+            ns_q_h, all_k_h, all_v_h,
+            attn_mask=attend_mask,
+            dropout_p=0.0,
+        )                                                    # (B, h, L_ns, head_dim)
+        # All-padding rows -> softmax of all -inf -> NaN; clamp to 0.
+        attn_out = torch.nan_to_num(attn_out, nan=0.0)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L_ns, self.d_model)
+        attn_out = self.out_proj(attn_out)                   # (B, L_ns, D)
+
+        # 8. Residual after attention.
+        x = ns_tokens + self.dropout(attn_out)               # (B, L_ns, D)
+
+        # 9. Per-token FFN (mixed parameterization on NS side).
+        ffn_out_list = []
+        for i in range(L_ns):
+            normed = self.ns_ffn_norm[i](x[:, i, :])
+            ffn_out_list.append(self.ns_ffns[i](normed))
+        ffn_out = torch.stack(ffn_out_list, dim=1)           # (B, L_ns, D)
+
+        # 10. Final residual.
+        return x + self.dropout(ffn_out)                     # (B, L_ns, D)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1417,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # OneTrans (ByteDance WWW 2026) -style enrichment head appended
+        # AFTER the HyFormer block stack. Causal attention over the
+        # concatenated [evolved_seq | NS] tokens with mixed parameterization
+        # (S shares QKV/FFN, each NS token has its own QKV/FFN). NS
+        # positions are pyramid-style sole query issuers so attention
+        # cost stays O(num_ns * L_total * d) instead of O(L_total^2).
+        use_onetrans_suffix: bool = False,
+        onetrans_hidden_mult: int = 4,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1440,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_onetrans_suffix = bool(use_onetrans_suffix)
+        self.onetrans_hidden_mult = int(onetrans_hidden_mult)
 
         # ================== NS Tokens Construction ==================
 
@@ -1404,6 +1602,34 @@ class PCVRHyFormer(nn.Module):
             )
             for _ in range(num_hyformer_blocks)
         ])
+
+        # ================== OneTrans suffix block (optional) ==================
+        # When enabled, runs ONCE after the HyFormer stack, taking evolved
+        # seq tokens + evolved NS tokens through a causal pyramid attention
+        # with mixed parameterization. The output (B, num_ns, D) is pooled
+        # via concat -> Linear -> LN to a (B, D) residual added to the
+        # pooled output before the classifier. Downside-bounded.
+        if self.use_onetrans_suffix:
+            self.onetrans_suffix = OneTransSuffixBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_ns_tokens=self.num_ns,
+                hidden_mult=self.onetrans_hidden_mult,
+                dropout=dropout_rate,
+            )
+            # Pool the (B, num_ns, D) enriched NS tokens into (B, D)
+            # residual via concat-then-project. Concat preserves per-token
+            # identity better than mean pool.
+            self.onetrans_pool_proj = nn.Sequential(
+                nn.Linear(self.num_ns * d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"OneTrans suffix enabled: causal pyramid attention over "
+                f"[evolved_seq | {self.num_ns} NS tokens] with mixed "
+                f"parameterization -> (B, {self.num_ns}, {d_model}) "
+                f"-> pooled to {d_model}-d residual"
+            )
 
         # ================== RoPE ==================
         if use_rope:
@@ -1587,9 +1813,16 @@ class PCVRHyFormer(nn.Module):
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
-        apply_dropout: bool = True
-    ) -> torch.Tensor:
-        """Runs the multi-sequence block stack with dropout and output projection."""
+        apply_dropout: bool = True,
+        return_evolved_state: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, list, list]]:
+        """Runs the multi-sequence block stack with dropout and output projection.
+
+        When ``return_evolved_state=True``, also returns the evolved
+        ``(curr_ns, curr_seqs, curr_masks)`` after all blocks have run.
+        Used by the optional OneTrans suffix head to enrich NS tokens
+        with causal attention over the full seq+NS state.
+        """
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
@@ -1629,6 +1862,8 @@ class PCVRHyFormer(nn.Module):
         output = all_q.view(B, -1)  # (B, Nq*S*D)
         output = self.output_proj(output)  # (B, D)
 
+        if return_evolved_state:
+            return output, curr_ns, curr_seqs, curr_masks
         return output
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
@@ -1664,11 +1899,29 @@ class PCVRHyFormer(nn.Module):
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
-        )
+        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection.
+        # If OneTrans suffix is enabled, also fetch evolved (ns, seqs, masks)
+        # for the post-block enrichment head.
+        if self.use_onetrans_suffix:
+            output, evolved_ns, evolved_seqs, evolved_masks = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=self.training,
+                return_evolved_state=True,
+            )
+            # 4b. OneTrans suffix: causal pyramid attention over
+            # [evolved seq | NS] with mixed parameterization; pool the
+            # enriched NS into a (B, D) residual.
+            enriched_ns = self.onetrans_suffix(
+                evolved_seqs, evolved_masks, evolved_ns)        # (B, num_ns, D)
+            B = enriched_ns.shape[0]
+            onetrans_residual = self.onetrans_pool_proj(
+                enriched_ns.reshape(B, -1))                     # (B, D)
+            output = output + onetrans_residual
+        else:
+            output = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=self.training,
+            )
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1705,10 +1958,21 @@ class PCVRHyFormer(nn.Module):
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
-        )
+        if self.use_onetrans_suffix:
+            output, evolved_ns, evolved_seqs, evolved_masks = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=False,
+                return_evolved_state=True,
+            )
+            enriched_ns = self.onetrans_suffix(
+                evolved_seqs, evolved_masks, evolved_ns)
+            B = enriched_ns.shape[0]
+            output = output + self.onetrans_pool_proj(enriched_ns.reshape(B, -1))
+        else:
+            output = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=False,
+            )
 
         logits = self.clsfier(output)
         return logits, output

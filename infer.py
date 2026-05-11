@@ -68,6 +68,11 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # onetrans-suffix branch: OneTrans-style causal pyramid attention with
+    # mixed parameterization as post-HyFormer NS-enrichment head.
+    # Auto-resolved from train_config.json by _MODEL_CFG_KEYS.
+    'use_onetrans_suffix': False,
+    'onetrans_hidden_mult': 4,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
