@@ -1067,6 +1067,49 @@ class GroupNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_groups, D)
 
 
+class SENetFeatureGating(nn.Module):
+    """FibiNET-style per-sample feature gating.
+
+    Given the stacked fid embeddings (B, num_fids, emb_dim), learn a
+    (B, num_fids) gate vector that re-weights each fid's contribution
+    BEFORE the embeddings are flattened and chunked into NS tokens. This
+    lets the model say "for this particular user, user_int_62 matters
+    twice as much as user_int_3, and user_int_99 is mostly noise" --
+    a per-sample inductive bias the baseline RankMixerNSTokenizer cannot
+    express (it gives every fid equal weight regardless of input).
+
+    Squeeze: per-fid scalar summary via mean over emb_dim.
+    Excitation: 2-layer MLP with reduction ratio `r`. Output passed
+    through ``2 * sigmoid`` so gates fall in [0, 2] -- the neutral 1.0
+    sits in the middle so the model can easily learn "no-op" if useful.
+
+    Param count: 2 * num_fids * (num_fids // r) + num_fids // r + num_fids.
+    For r=4 and num_fids=46 (user side) that's ~1.1K params; for
+    num_fids=14 (item side) ~200 params. Negligible.
+    """
+
+    def __init__(self, num_fids: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(num_fids // reduction, 4)
+        self.fc1 = nn.Linear(num_fids, hidden)
+        self.fc2 = nn.Linear(hidden, num_fids)
+
+    def forward(self, embs: torch.Tensor) -> torch.Tensor:
+        """Re-weight the input embeddings by learned per-sample gates.
+
+        Args:
+            embs: (B, num_fids, emb_dim) stacked fid embeddings.
+
+        Returns:
+            (B, num_fids, emb_dim) gated embeddings; same shape, just
+            scaled per-(sample, fid) by gates in [0, 2].
+        """
+        summary = embs.mean(dim=-1)                  # (B, num_fids)
+        x = F.relu(self.fc1(summary))                # (B, hidden)
+        gates = 2.0 * torch.sigmoid(self.fc2(x))     # (B, num_fids) in [0, 2]
+        return embs * gates.unsqueeze(-1)            # (B, num_fids, emb_dim)
+
+
 class RankMixerNSTokenizer(nn.Module):
     """NS Tokenizer following the RankMixer paper's approach.
 
@@ -1083,6 +1126,8 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        use_senet_gating: bool = False,
+        senet_reduction: int = 4,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1093,6 +1138,11 @@ class RankMixerNSTokenizer(nn.Module):
             d_model: Output token dimension.
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            use_senet_gating: When True, run the per-fid embeddings through
+                a SENetFeatureGating module before the concat-split step.
+                This adds learnable per-sample feature importance, which the
+                baseline RankMixer architecture cannot express.
+            senet_reduction: Hidden-dim reduction ratio for the SENet MLP.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1100,6 +1150,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.use_senet_gating = bool(use_senet_gating)
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1139,10 +1190,23 @@ class RankMixerNSTokenizer(nn.Module):
             for _ in range(num_ns_tokens)
         ])
 
+        # Optional SENet feature gating module (FibiNET-style). Built
+        # only when use_senet_gating=True; otherwise the .forward path
+        # falls through to the baseline concat-split flow with zero
+        # SENet param overhead.
+        self._num_fids_total = total_num_fids
+        if self.use_senet_gating:
+            self.senet = SENetFeatureGating(
+                num_fids=total_num_fids,
+                reduction=senet_reduction,
+            )
+
         logging.info(
             f"RankMixerNSTokenizer: {total_num_fids} fids, "
             f"total_emb_dim={total_emb_dim}, chunk_dim={self.chunk_dim}, "
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
+            + (f", SENet gating ENABLED (reduction={senet_reduction})"
+               if self.use_senet_gating else "")
         )
 
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
@@ -1154,7 +1218,7 @@ class RankMixerNSTokenizer(nn.Module):
         Returns:
             (B, num_ns_tokens, d_model) tensor.
         """
-        # 1. Embed all fids in group order → flat cat
+        # 1. Embed all fids in group order
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
@@ -1174,7 +1238,17 @@ class RankMixerNSTokenizer(nn.Module):
                         fid_emb = (emb_all * mask).sum(dim=1) / count
                 all_embs.append(fid_emb)
 
-        cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
+        # 1b. Optional SENet per-sample feature gating BEFORE the flat
+        # concat. Stack first so the gating module sees a (B, num_fids,
+        # emb_dim) view; reshape back to (B, total_emb_dim) preserves
+        # the EXACT same memory layout the baseline cat(...) produced,
+        # so the downstream chunk-split is unchanged.
+        if self.use_senet_gating:
+            embs_stacked = torch.stack(all_embs, dim=1)         # (B, num_fids, emb_dim)
+            embs_stacked = self.senet(embs_stacked)             # gated
+            cat_emb = embs_stacked.reshape(int_feats.shape[0], -1)
+        else:
+            cat_emb = torch.cat(all_embs, dim=-1)               # (B, total_emb_dim)
 
         # 2. Pad if needed
         if self._pad_size > 0:
@@ -1229,6 +1303,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # SENet (FibiNET-style) per-sample feature gating applied BEFORE
+        # the RankMixerNSTokenizer's flat concat-and-chunk step. Adds a
+        # learnable per-(sample, fid) weight so the model can say "for
+        # THIS user, feature X matters more than Y" instead of weighting
+        # every fid equally regardless of input. Active only when
+        # ns_tokenizer_type='rankmixer' (the gating wraps that tokenizer).
+        use_senet_gating: bool = False,
+        senet_reduction: int = 4,
     ) -> None:
         super().__init__()
 
@@ -1280,6 +1362,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                use_senet_gating=use_senet_gating,
+                senet_reduction=senet_reduction,
             )
             num_user_ns = user_ns_tokens
 
@@ -1290,6 +1374,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                use_senet_gating=use_senet_gating,
+                senet_reduction=senet_reduction,
             )
             num_item_ns = item_ns_tokens
         else:
