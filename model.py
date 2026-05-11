@@ -415,10 +415,23 @@ class RankMixerBlock(nn.Module):
 class MultiSeqQueryGenerator(nn.Module):
     """Multi-sequence query generation module.
 
-    Generates Q tokens independently for each sequence:
-    For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
-        Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
+    Two modes:
+
+    * Default (use_cross_seq_pool=False, baseline behavior):
+        For each sequence i:
+            GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+            Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
+
+    * Cross-seq pool (use_cross_seq_pool=True, HyFormer paper §4.2.2):
+        CrossSeqPool = Concat(MeanPool(Seq_1), ..., MeanPool(Seq_S))
+        GlobalInfo = Concat(F1..FM, CrossSeqPool)        # shared across i
+        Q_i = [FFN_{i,1}(GlobalInfo), ..., FFN_{i,N}(GlobalInfo)]
+
+    The ablation in HyFormer paper Table 2 reports -0.05% AUC when the
+    cross-sequence pooling tokens are removed -- i.e., the full HyFormer
+    in production uses inter-sequence pool tokens here, not just the
+    matching sequence's pool. The baseline in this repo had the
+    simpler per-seq pool form, which leaves that lift on the table.
     """
 
     def __init__(
@@ -427,14 +440,20 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
+        use_cross_seq_pool: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.use_cross_seq_pool = bool(use_cross_seq_pool)
 
-        global_info_dim = (num_ns + 1) * d_model
+        # In cross-seq mode the global info carries S pool tokens (one per
+        # sequence) instead of just the matching sequence's pool, so the
+        # downstream concat dim grows from (M+1)*D to (M+S)*D.
+        n_pool_tokens = num_sequences if self.use_cross_seq_pool else 1
+        global_info_dim = (num_ns + n_pool_tokens) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
@@ -473,17 +492,25 @@ class MultiSeqQueryGenerator(nn.Module):
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
 
-        q_tokens_list = []
+        # Mean-pool each sequence once (cheap; reused across queries below).
+        seq_pools = []
         for i in range(self.num_sequences):
-            # MeanPool(Seq_i)
             valid_mask = ~seq_padding_masks[i]  # True = valid
             valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
             seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-            seq_pooled = seq_sum / seq_count  # (B, D)
+            seq_pools.append(seq_sum / seq_count)  # (B, D)
 
-            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+        if self.use_cross_seq_pool:
+            # Shared inter-sequence context for every sequence's queries.
+            cross_seq_pool = torch.cat(seq_pools, dim=-1)  # (B, S*D)
+
+        q_tokens_list = []
+        for i in range(self.num_sequences):
+            if self.use_cross_seq_pool:
+                global_info = torch.cat([ns_flat, cross_seq_pool], dim=-1)  # (B, (M+S)*D)
+            else:
+                global_info = torch.cat([ns_flat, seq_pools[i]], dim=-1)  # (B, (M+1)*D)
             global_info = self.global_info_norm(global_info)
 
             # Generate N query tokens
@@ -1229,6 +1256,11 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Cross-sequence pooling in Query Generation (HyFormer paper §4.2.2):
+        # when True, each sequence's query FFNs see the pool of ALL sequences
+        # rather than just its own pool. Paper ablation reports -0.05% AUC
+        # when removed from the full HyFormer.
+        use_cross_seq_pool: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1276,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_cross_seq_pool = bool(use_cross_seq_pool)
 
         # ================== NS Tokens Construction ==================
 
@@ -1385,7 +1418,14 @@ class PCVRHyFormer(nn.Module):
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
+            use_cross_seq_pool=self.use_cross_seq_pool,
         )
+        if self.use_cross_seq_pool:
+            logging.info(
+                f"Cross-seq pool enabled in Query Generation: each seq's "
+                f"queries see {self.num_sequences} pool tokens "
+                f"(global_info = NS + all seq pools)"
+            )
 
         # MultiSeqHyFormerBlock stack
         self.blocks = nn.ModuleList([
