@@ -68,6 +68,9 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # time-features branch: 1 NS token from per-domain recency + velocity.
+    # Auto-resolved from train_config.json by _MODEL_CFG_KEYS.
+    'use_recency_velocity': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -292,6 +295,13 @@ def _batch_to_model_input(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
+    # Forward synthesized time features when present in the batch dict.
+    context_feats = {
+        k: device_batch[k]
+        for k in ('ctx_recency', 'ctx_vel_1h', 'ctx_vel_24h')
+        if k in device_batch
+    } or None
+
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
@@ -300,6 +310,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        context_feats=context_feats,
     )
 
 

@@ -131,6 +131,19 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Velocity-count bucket edges. Used by ctx_vel_1h / ctx_vel_24h to bucketize
+# the number of actions in a (1h or 24h) window into log-spaced buckets:
+#   count == 0  -> bucket 0
+#   count == 1  -> bucket 1
+#   count 2-4   -> bucket 2
+#   count 5-9   -> bucket 3
+#   count 10-19 -> bucket 4
+#   count 20-49 -> bucket 5
+#   count 50-99 -> bucket 6
+#   count >=100 -> bucket 7
+VELOCITY_BUCKETS = np.array([1, 2, 5, 10, 20, 50, 100], dtype=np.int64)
+NUM_VELOCITY_BUCKETS = len(VELOCITY_BUCKETS) + 1
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -581,8 +594,21 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
+        # ---- Time-feature accumulators (user-level recency + velocity) ----
+        # ctx_recency[i, d]  -- bucket index of "time since most recent
+        #     action in domain d" for user i. 0 = no data, 1..64 = real buckets
+        #     (same BUCKET_BOUNDARIES as the in-sequence time-bucket emb).
+        # ctx_vel_1h[i, d]   -- raw count of actions in domain d in the last
+        #     1 hour before impression. Will be log-bucketed at the end of
+        #     _convert_batch via VELOCITY_BUCKETS into [0, 7].
+        # ctx_vel_24h[i, d]  -- same, but 24-hour window.
+        num_dom = len(self.seq_domains)
+        ctx_recency = np.zeros((B, num_dom), dtype=np.int64)
+        ctx_vel_1h_raw = np.zeros((B, num_dom), dtype=np.int64)
+        ctx_vel_24h_raw = np.zeros((B, num_dom), dtype=np.int64)
+
         # ---- Sequence features: fused padding directly into the 3D buffer ----
-        for domain in self.seq_domains:
+        for domain_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
@@ -664,7 +690,51 @@ class PCVRParquetDataset(IterableDataset):
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
 
+                # ---- User-level time-features for this domain ----
+                # Sequences are descending sorted by timestamp; reading from
+                # the *raw* Arrow buffer (not the padded buffer) means we see
+                # only valid entries, so position 0 (when present) is the
+                # newest. Each user contributes one recency bucket + two
+                # velocity counts (1h, 24h) for this domain.
+                for i in range(B):
+                    s_off = int(ts_offs[i])
+                    e_off = int(ts_offs[i + 1])
+                    if e_off <= s_off:
+                        continue
+                    latest = int(ts_vals[s_off])
+                    if latest > 0:
+                        delta = int(timestamps[i]) - latest
+                        if delta < 0:
+                            delta = 0
+                        r_raw = int(np.searchsorted(BUCKET_BOUNDARIES, delta))
+                        r_raw = max(0, min(r_raw, len(BUCKET_BOUNDARIES) - 1))
+                        ctx_recency[i, domain_idx] = r_raw + 1
+                    # Velocity: count valid actions whose impression-delta
+                    # falls inside the (1h, 24h) windows. Sequences are
+                    # descending sorted, so a searchsorted on the delta
+                    # array would be cleanest, but we just mask + sum.
+                    user_ts = ts_vals[s_off:e_off]
+                    valid = user_ts > 0
+                    if not valid.any():
+                        continue
+                    delta_all = int(timestamps[i]) - user_ts[valid]
+                    # past actions only (delta >= 0)
+                    delta_pos = delta_all[delta_all >= 0]
+                    ctx_vel_1h_raw[i, domain_idx] = int((delta_pos <= 3600).sum())
+                    ctx_vel_24h_raw[i, domain_idx] = int((delta_pos <= 86400).sum())
+
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+
+        # ---- Bucketize velocity counts ----
+        # VELOCITY_BUCKETS is the edge list; searchsorted with side='right'
+        # maps raw counts to bucket index in [0, len(VELOCITY_BUCKETS)].
+        # 0 = "zero actions in window", 7 = "100+ actions".
+        ctx_vel_1h = np.searchsorted(VELOCITY_BUCKETS, ctx_vel_1h_raw, side='right')
+        ctx_vel_24h = np.searchsorted(VELOCITY_BUCKETS, ctx_vel_24h_raw, side='right')
+
+        result['ctx_recency'] = torch.from_numpy(ctx_recency)
+        result['ctx_vel_1h'] = torch.from_numpy(ctx_vel_1h.astype(np.int64))
+        result['ctx_vel_24h'] = torch.from_numpy(ctx_vel_24h.astype(np.int64))
 
         return result
 
@@ -681,12 +751,17 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    valid_gap_ratio: float = 0.0,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
     The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    Groups (in the file order returned by ``glob``). When ``valid_gap_ratio``
+    is > 0, an additional gap of that fraction of total RGs is skipped
+    between train and val, simulating "test is N days into the future" so
+    that time-dependent features are forced to generalize across a time
+    gap instead of memorizing the calendar phase of train's tail.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -707,18 +782,28 @@ def get_pcvr_data(
     total_rgs = len(rg_info)
 
     n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
+    n_gap_rgs = max(0, int(total_rgs * valid_gap_ratio))
+    n_train_rgs = max(1, total_rgs - n_valid_rgs - n_gap_rgs)
 
     # train_ratio: use only the first N% of the training Row Groups.
     if train_ratio < 1.0:
         n_train_rgs = max(1, int(n_train_rgs * train_ratio))
         logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+    # Val starts after train AND the (optional) gap.
+    val_start = n_train_rgs + n_gap_rgs
 
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+    valid_rows = sum(r[2] for r in rg_info[val_start:])
+
+    if n_gap_rgs > 0:
+        gap_rows = sum(r[2] for r in rg_info[n_train_rgs:val_start])
+        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                     f"{n_gap_rgs} gap ({gap_rows} rows, skipped), "
+                     f"{n_valid_rgs} valid ({valid_rows} rows)")
+    else:
+        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                     f"{n_valid_rgs} valid ({valid_rows} rows)")
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -749,7 +834,7 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
+        row_group_range=(val_start, total_rgs),
         clip_vocab=clip_vocab,
     )
     valid_loader = DataLoader(

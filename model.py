@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -16,6 +16,10 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Synthesized user-level time features: per-domain recency (B, 4) and
+    # velocity counts (B, 4) for 1h and 24h windows. Consumed only when
+    # use_recency_velocity=True.
+    context_feats: Optional[Dict[str, torch.Tensor]] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1189,6 +1193,67 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class RecencyVelocityTokenizer(nn.Module):
+    """Aggregates 12 categorical time features into a single NS token.
+
+    Features (all per-domain, num_domains = 4: a/b/c/d):
+      - recency      [B, 4]: bucket of "time since most recent action in
+                              this domain" (vocab = NUM_TIME_BUCKETS = 65,
+                              0 = no data, 1..64 = real buckets).
+      - vel_1h       [B, 4]: bucketed count of actions in last 1 hour
+                              (vocab = NUM_VELOCITY_BUCKETS = 8).
+      - vel_24h      [B, 4]: same but 24-hour window.
+
+    Each of the 12 features gets its own ``d_model``-wide embedding.
+    We SUM the 12 embedding vectors (not concat) -> LayerNorm -> Linear
+    -> SiLU. Sum lets the model independently add information from each
+    feature axis; LayerNorm rescales the post-sum magnitude.
+
+    Total params ≈ 4 * 65 * 64 + 8 * 8 * 64 + 64 * 64 + 64 ≈ 21K.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_domains: int = 4,
+        num_recency_buckets: int = 65,
+        num_velocity_buckets: int = 8,
+    ) -> None:
+        super().__init__()
+        self.num_domains = num_domains
+        self.d_model = d_model
+        self.recency_embs = nn.ModuleList([
+            nn.Embedding(num_recency_buckets, d_model, padding_idx=0)
+            for _ in range(num_domains)
+        ])
+        self.vel_1h_embs = nn.ModuleList([
+            nn.Embedding(num_velocity_buckets, d_model)
+            for _ in range(num_domains)
+        ])
+        self.vel_24h_embs = nn.ModuleList([
+            nn.Embedding(num_velocity_buckets, d_model)
+            for _ in range(num_domains)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+        self.proj = nn.Linear(d_model, d_model)
+
+    def forward(
+        self,
+        recency: torch.Tensor,   # (B, num_domains) long
+        vel_1h: torch.Tensor,    # (B, num_domains) long
+        vel_24h: torch.Tensor,   # (B, num_domains) long
+    ) -> torch.Tensor:
+        # Sum of 12 d_model-wide embeddings -> (B, d_model).
+        x = self.recency_embs[0](recency[:, 0].long())
+        for i in range(1, self.num_domains):
+            x = x + self.recency_embs[i](recency[:, i].long())
+        for i in range(self.num_domains):
+            x = x + self.vel_1h_embs[i](vel_1h[:, i].long())
+            x = x + self.vel_24h_embs[i](vel_24h[:, i].long())
+        x = self.norm(x)
+        return F.silu(self.proj(x)).unsqueeze(1)   # (B, 1, d_model)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1294,13 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Recency + velocity feature: when True, add ONE extra NS token
+        # built from per-domain (recency, vel_1h, vel_24h) -- 12 categorical
+        # features compressed into d_model via a RecencyVelocityTokenizer.
+        # To keep T = num_queries*num_sequences + num_ns divisible by
+        # d_model = 64, run.sh reduces user_ns_tokens 5 -> 4.
+        use_recency_velocity: bool = False,
+        num_domains_for_recency: int = 4,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1316,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_recency_velocity = bool(use_recency_velocity)
 
         # ================== NS Tokens Construction ==================
 
@@ -1311,9 +1384,21 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ================== Recency + Velocity token (optional, +1 NS token) ==================
+        if self.use_recency_velocity:
+            self.recency_velocity_tokenizer = RecencyVelocityTokenizer(
+                d_model=d_model,
+                num_domains=num_domains_for_recency,
+            )
+            logging.info(
+                "Recency+Velocity token enabled: 12 categorical "
+                f"(recency_x{num_domains_for_recency} + vel_1h_x{num_domains_for_recency} "
+                f"+ vel_24h_x{num_domains_for_recency}) -> 1 extra NS token")
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if self.use_recency_velocity else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1645,6 +1730,14 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.use_recency_velocity:
+            cf = inputs.context_feats or {}
+            rv_tok = self.recency_velocity_tokenizer(
+                cf['ctx_recency'],
+                cf['ctx_vel_1h'],
+                cf['ctx_vel_24h'],
+            )
+            ns_parts.append(rv_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1688,6 +1781,14 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.use_recency_velocity:
+            cf = inputs.context_feats or {}
+            rv_tok = self.recency_velocity_tokenizer(
+                cf['ctx_recency'],
+                cf['ctx_vel_1h'],
+                cf['ctx_vel_24h'],
+            )
+            ns_parts.append(rv_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
