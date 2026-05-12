@@ -624,6 +624,111 @@ def _log_summary(report: Dict[str, Any]) -> None:
                 f"empty_rate={v.get('empty_rate', 0):.3f} "
                 f"value_max={v.get('value_max', 0)}")
 
+    # Full feature table -- one TSV line per feature. Designed so the
+    # entire EDA result is recoverable by reading the log alone (no need
+    # to download the JSON). Lines are prefixed with "TSV" so a single
+    # ``grep '^TSV ' eda.log`` extracts a clean table.
+    _log_feature_table_tsv(feats)
+    # Likewise dump the sample-level histograms / delay distribution as
+    # KV lines that are easy to copy/paste back.
+    _log_sample_table_tsv(s)
+
+
+def _fmt(v: Any) -> str:
+    """TSV-friendly formatter (numeric -> short repr, None -> '')."""
+    if v is None:
+        return ''
+    if isinstance(v, float):
+        if abs(v) >= 1e6 or (abs(v) < 1e-3 and v != 0):
+            return f'{v:.6g}'
+        return f'{v:.6f}'.rstrip('0').rstrip('.')
+    if isinstance(v, (list, tuple)):
+        return '|'.join(_fmt(x) for x in v)
+    return str(v)
+
+
+def _log_feature_table_tsv(features: Dict[str, Any]) -> None:
+    """Emit one TSV line per feature. Columns are constant across rows so a
+    spreadsheet paste lines up; missing values appear as empty fields.
+    """
+    logging.info('')
+    logging.info('==== FULL FEATURE TABLE (lines prefixed with "TSV ") ====')
+    logging.info(
+        'TSV  name\tkind\tdtype\tn_total\tnull_rate\tzero_or_empty_rate\t'
+        'min\tmax\tmean\tstd\tunique_sampled\tunique_capped\t'
+        'len_mean\tlen_p95\tlen_max\tflat_zero_rate\t'
+        'auc_1d_or_best\tauc_signal\tauc_via_mean\tauc_via_first_nz\tauc_via_max')
+    # Sort by AUC signal (descending) so the most predictive features
+    # come first; ties break by name.
+    def keyfn(item):
+        v = item[1]
+        sig = v.get('auc_signal')
+        if sig is None and 'auc_1d' in v:
+            sig = abs(v['auc_1d'] - 0.5) * 2
+        return (-(sig or 0.0), item[0])
+    for name, v in sorted(features.items(), key=keyfn):
+        kind = v.get('column_kind', '?')
+        dtype = v.get('dtype_kind', '?')
+        n_total = v.get('n_total', 0)
+        null_rate = v.get('null_rate', 0)
+        # scalars expose zero_rate, arrays expose empty_rate -- merge into one column
+        zoer = v.get('zero_rate', v.get('empty_rate', None))
+        mn = v.get('min', v.get('value_min', None))
+        mx = v.get('max', v.get('value_max', None))
+        mean = v.get('mean', None)
+        std = v.get('std', None)
+        uniq = v.get('unique_sampled', None)
+        uniq_capped = v.get('unique_capped', None)
+        len_mean = v.get('len_mean', None)
+        len_p95 = v.get('len_p95', None)
+        len_max = v.get('len_max', None)
+        flat_zero = v.get('flat_zero_rate', None)
+        auc_main = v.get('auc_1d', v.get('auc_best'))
+        sig = v.get('auc_signal')
+        auc_mean = v.get('auc_via_mean')
+        auc_first = v.get('auc_via_first_nz')
+        auc_max = v.get('auc_via_max')
+        logging.info(
+            f'TSV  {name}\t{kind}\t{dtype}\t{n_total}\t{_fmt(null_rate)}\t'
+            f'{_fmt(zoer)}\t{_fmt(mn)}\t{_fmt(mx)}\t{_fmt(mean)}\t{_fmt(std)}\t'
+            f'{_fmt(uniq)}\t{_fmt(uniq_capped)}\t'
+            f'{_fmt(len_mean)}\t{_fmt(len_p95)}\t{_fmt(len_max)}\t'
+            f'{_fmt(flat_zero)}\t{_fmt(auc_main)}\t{_fmt(sig)}\t'
+            f'{_fmt(auc_mean)}\t{_fmt(auc_first)}\t{_fmt(auc_max)}')
+
+
+def _log_sample_table_tsv(sample: Dict[str, Any]) -> None:
+    """Emit sample-level histograms as KV lines (each ``KV key=value`` is
+    easy to extract via ``grep '^KV '``).
+    """
+    logging.info('')
+    logging.info('==== SAMPLE-LEVEL KV (lines prefixed with "KV ") ====')
+    flat_keys = ['n_rows', 'timestamp_min', 'timestamp_max',
+                 'timestamp_span_seconds', 'timestamp_span_days',
+                 'positive_rate_label2', 'delay_negative_count',
+                 'delay_pos_mean_seconds']
+    for k in flat_keys:
+        if k in sample:
+            logging.info(f'KV  {k}\t{_fmt(sample[k])}')
+    if 'label_type_counts' in sample:
+        for lt, c in sample['label_type_counts'].items():
+            logging.info(f'KV  label_type_{lt}_count\t{c}')
+    if 'hour_histogram' in sample:
+        for h, c in enumerate(sample['hour_histogram']):
+            logging.info(f'KV  hour_count_{h:02d}\t{c}')
+    if 'hour_positive_rate' in sample:
+        for h, r in enumerate(sample['hour_positive_rate']):
+            logging.info(f'KV  hour_pos_rate_{h:02d}\t{_fmt(r)}')
+    if 'dow_histogram' in sample:
+        for d, c in enumerate(sample['dow_histogram']):
+            logging.info(f'KV  dow_count_{d}\t{c}')
+    if 'delay_hist_all' in sample and 'delay_bins' in sample:
+        bins = sample['delay_bins']
+        for b, c_all, c_pos in zip(bins, sample['delay_hist_all'],
+                                    sample.get('delay_hist_pos', [0] * len(bins))):
+            logging.info(f'KV  delay_{b}_all\t{c_all}')
+            logging.info(f'KV  delay_{b}_pos\t{c_pos}')
+
 
 # ─────────────────────────────── Entry point ────────────────────────────────
 
