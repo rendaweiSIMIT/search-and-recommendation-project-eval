@@ -151,6 +151,7 @@ class PCVRParquetDataset(IterableDataset):
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
+        row_group_indices: Optional[List[int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
     ) -> None:
@@ -199,7 +200,16 @@ class PCVRParquetDataset(IterableDataset):
             for i in range(pf.metadata.num_row_groups):
                 self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
 
-        if row_group_range is not None:
+        # Row Group selection:
+        #   * row_group_indices (when set): pick exactly these positional
+        #     indices from the sorted rg_list. Used for shuffle-based val
+        #     splits where train and val RGs are scattered through time.
+        #   * row_group_range (when set): contiguous (start, end) slice.
+        #     Used for the baseline positional split.
+        # If both are None the full rg_list is kept.
+        if row_group_indices is not None:
+            self._rg_list = [self._rg_list[i] for i in row_group_indices]
+        elif row_group_range is not None:
             start, end = row_group_range
             self._rg_list = self._rg_list[start:end]
 
@@ -570,6 +580,14 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- Synthesized context feature: hour-of-day ----
+        # Derived from the sample-level timestamp. Always emitted so the
+        # eval container picks it up from the same dataset code path; the
+        # model only consumes it when use_hour=True. The 3.86-day data
+        # window samples every hour 3-4 times, giving the model enough
+        # per-bucket observations to learn a hour -> CVR mapping.
+        ctx_hour = ((timestamps // 3600) % 24).astype(np.int64)
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
@@ -577,6 +595,7 @@ class PCVRParquetDataset(IterableDataset):
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
+            'ctx_hour': torch.from_numpy(ctx_hour),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }
@@ -681,12 +700,21 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    shuffle_val_seed: int = 0,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
-    The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    Validation split modes:
+      * shuffle_val_seed == 0 (default, baseline): positional split -- the
+        last ``valid_ratio`` fraction of Row Groups becomes val. Val window
+        is contiguous in time (e.g. the last ~9 hours of a 3.86-day window).
+      * shuffle_val_seed > 0: random RG-level split -- after deterministic
+        shuffle with that seed, the first ``valid_ratio`` fraction of the
+        shuffled RG list becomes val. Val RGs are scattered through time,
+        so val covers ALL hours-of-day / days-of-week observed in train.
+        Useful for testing whether absolute-time features generalize
+        beyond the narrow window that positional val exposes.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -709,16 +737,47 @@ def get_pcvr_data(
     n_valid_rgs = max(1, int(total_rgs * valid_ratio))
     n_train_rgs = total_rgs - n_valid_rgs
 
-    # train_ratio: use only the first N% of the training Row Groups.
-    if train_ratio < 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
-
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
-
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+    # ------------------------------------------------------------------
+    # Pick the index sets that go to train / val.
+    # ------------------------------------------------------------------
+    if shuffle_val_seed > 0:
+        # Deterministic RG-level shuffle: independent of ``--seed`` so the
+        # train-loop shuffle and the val-split shuffle do not collide.
+        rng = random.Random(shuffle_val_seed)
+        all_indices = list(range(total_rgs))
+        rng.shuffle(all_indices)
+        valid_indices = sorted(all_indices[:n_valid_rgs])
+        train_indices = sorted(all_indices[n_valid_rgs:])
+        # train_ratio: still meaningful in shuffle mode -- keep first N%
+        # of the shuffled train pool (note: order is from sorted indices
+        # so this is reproducible).
+        if train_ratio < 1.0:
+            n_keep = max(1, int(len(train_indices) * train_ratio))
+            train_indices = train_indices[:n_keep]
+            logging.info(
+                f"train_ratio={train_ratio}: using {n_keep} train Row "
+                f"Groups (shuffle_val mode)")
+        train_rows = sum(rg_info[i][2] for i in train_indices)
+        valid_rows = sum(rg_info[i][2] for i in valid_indices)
+        logging.info(
+            f"Row Group split (shuffle_val_seed={shuffle_val_seed}): "
+            f"{len(train_indices)} train ({train_rows} rows), "
+            f"{len(valid_indices)} valid ({valid_rows} rows). "
+            f"Val RGs are scattered through the time window.")
+        train_rg_kwargs = {'row_group_indices': train_indices}
+        valid_rg_kwargs = {'row_group_indices': valid_indices}
+    else:
+        # train_ratio: use only the first N% of the training Row Groups.
+        if train_ratio < 1.0:
+            n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+            logging.info(
+                f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                     f"{n_valid_rgs} valid ({valid_rows} rows)")
+        train_rg_kwargs = {'row_group_range': (0, n_train_rgs)}
+        valid_rg_kwargs = {'row_group_range': (n_train_rgs, total_rgs)}
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -727,8 +786,8 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        **train_rg_kwargs,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -749,8 +808,8 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        **valid_rg_kwargs,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

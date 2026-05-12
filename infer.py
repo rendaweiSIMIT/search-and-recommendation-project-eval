@@ -68,6 +68,12 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Hour-of-day NS token (exp/hour-shuffle-val). When True, the model
+    # state_dict has hour_emb (24-class) + hour_proj weights and num_ns
+    # includes one extra slot. shuffle_val_seed is intentionally NOT
+    # mirrored here: it only affects training-time val split and has no
+    # bearing on inference architecture.
+    'use_hour': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -292,6 +298,14 @@ def _batch_to_model_input(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
+    # Mirror trainer._make_model_input: pass any synthesized context feats
+    # through so use_hour (or future flag) checkpoints find the data they
+    # expect on inputs.context_feats.
+    context_feats: Dict[str, torch.Tensor] = {}
+    for key in ('ctx_hour',):
+        if key in device_batch:
+            context_feats[key] = device_batch[key]
+
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
@@ -300,6 +314,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        context_feats=context_feats or None,
     )
 
 
