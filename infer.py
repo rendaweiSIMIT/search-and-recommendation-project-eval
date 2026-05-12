@@ -68,6 +68,12 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Real DIN + MLP head (exp/din-real). When True the model has a
+    # DINMLPHead module (DINAttention x num_sequences + projection +
+    # fusion MLP). The flag must match the training-time value or the
+    # state_dict shape mismatch will fail load.
+    'use_din_real': False,
+    'din_hidden_mult': 2,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

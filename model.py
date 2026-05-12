@@ -1189,6 +1189,190 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIN (Alibaba KDD 2018) head
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class DINAttention(nn.Module):
+    """Real DIN-style MLP-scored attention head.
+
+    Faithful to the DIN paper's attention formulation (in contrast to the
+    softmax(QK/sqrt(d)) "scaled dot-product" cross-attention we used in
+    exp/din-style):
+
+        per-position score  s_j = MLP([q, k_j, q - k_j, q (*) k_j])
+        weights             w_j = softmax(s_j) over j (masked over padding)
+        output              o    = sum_j w_j * k_j
+
+    The 4-way concat ``[q, k, q-k, q*k]`` is what makes DIN distinct: it
+    lets the scoring MLP read both raw vectors AND their interaction
+    (difference and elementwise product), enabling non-linear "is this
+    candidate relevant to this historical item?" matching, which a single
+    dot product cannot express.
+
+    Single query (B, D), single key/value tensor (B, L, D). For multiple
+    queries call the module multiple times; we keep the implementation
+    lean so the memory peak stays at (B, L, 4D) rather than (B, Lq, L, 4D).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        hidden_mult: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.score_mlp = nn.Sequential(
+            nn.Linear(4 * d_model, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run DIN-MLP attention.
+
+        Args:
+            query: (B, D), the candidate target embedding.
+            keys: (B, L, D), the user-history token embeddings (also serve
+                as values; following DIN paper's setup k = v).
+            key_padding_mask: (B, L), True at padding positions.
+
+        Returns:
+            (B, D) target-aware pooled history representation.
+        """
+        B, L, D = keys.shape
+        # Expand query to align with keys' position dim: (B, L, D)
+        q_exp = query.unsqueeze(1).expand(B, L, D)
+        diff = q_exp - keys
+        prod = q_exp * keys
+        # MLP input: (B, L, 4D)
+        feat = torch.cat([q_exp, keys, diff, prod], dim=-1)
+        scores = self.score_mlp(feat).squeeze(-1)         # (B, L)
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask, float('-inf'))
+        weights = F.softmax(scores, dim=-1)
+        # All-padding rows collapse to NaN after softmax of all-(-inf); zero
+        # them out so the weighted sum yields a zero vector rather than NaN.
+        weights = torch.nan_to_num(weights, nan=0.0)
+        weights = self.attn_dropout(weights)
+        # Weighted sum: (B, D)
+        out = torch.einsum('bl,bld->bd', weights, keys)
+        return out
+
+
+class DINMLPHead(nn.Module):
+    """DIN (target-aware aggregation) + MLP (fusion with HyFormer pooled).
+
+    Pipeline:
+
+      1. Aggregate the item-side NS tokens into ONE candidate query vector
+         ``q (B, D)`` via a small linear projection. Using all item NS
+         tokens (instead of just item_id) keeps the candidate
+         representation faithful to whatever the NS tokenizer produces
+         downstream of item_int features.
+
+      2. For each of S behavior-sequence domains, run a real DIN attention
+         (MLP scoring) with ``q`` as the candidate and the raw seq tokens
+         as keys/values. Yields S vectors of shape (B, D).
+
+      3. Concat the S DIN outputs and project back to (B, D); this is the
+         target-aware user history representation aggregated across all
+         four domains.
+
+      4. Concat ``[hyformer_pooled, din_pooled]`` and pass through a 2-layer
+         fusion MLP. The MLP -- NOT a residual addition -- is the "MLP"
+         in "DIN + MLP" per the original Alibaba paper. It lets the model
+         learn how to weight HyFormer's mixed pooled output against the
+         pure target-aware DIN signal, instead of forcing the contribution
+         to be additive (which our previous exp/din-style enforced and
+         likely caused it to underperform).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_sequences: int,
+        num_item_ns_total: int,
+        hidden_mult: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_sequences = num_sequences
+        # Step 1: candidate query from item-side NS tokens
+        self.candidate_proj = nn.Sequential(
+            nn.Linear(num_item_ns_total * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        # Step 2: per-domain DIN attention
+        self.din_attns = nn.ModuleList([
+            DINAttention(d_model, hidden_mult=hidden_mult, dropout=dropout)
+            for _ in range(num_sequences)
+        ])
+        # Step 3: cross-domain projection
+        self.domain_proj = nn.Sequential(
+            nn.Linear(num_sequences * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        # Step 4: fusion MLP (DIN paper's prediction head, narrowed to
+        # produce a (B, D) replacement pooled vector that the existing
+        # classifier head then consumes).
+        fusion_hidden = d_model * hidden_mult
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2 * d_model, fusion_hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_hidden, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(
+        self,
+        hyformer_pooled: torch.Tensor,
+        item_ns: torch.Tensor,
+        seq_tokens_list: List[torch.Tensor],
+        seq_masks_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run DIN attention per domain and fuse with HyFormer pooled.
+
+        Args:
+            hyformer_pooled: (B, D), output of the existing HyFormer stack
+                + ``output_proj``.
+            item_ns: (B, num_item_ns_total, D), item-side slice of the NS
+                tokens. Used to build the candidate query.
+            seq_tokens_list: list of (B, L_i, D) raw per-domain seq token
+                tensors -- the un-evolved versions, matching DIN paper's
+                "match candidate against raw history" formulation.
+            seq_masks_list: list of (B, L_i) padding masks (True at pad).
+
+        Returns:
+            (B, D) fused pooled output that replaces the original
+            HyFormer pooled output before the classifier.
+        """
+        B = item_ns.shape[0]
+        # 1. Candidate query from item NS tokens
+        candidate_q = self.candidate_proj(item_ns.reshape(B, -1))   # (B, D)
+        # 2. Per-domain DIN attention
+        per_domain = []
+        for i, (seq_t, seq_m) in enumerate(zip(seq_tokens_list, seq_masks_list)):
+            din_out = self.din_attns[i](candidate_q, seq_t, seq_m)  # (B, D)
+            per_domain.append(din_out)
+        # 3. Combine domains
+        din_combined = torch.cat(per_domain, dim=-1)                # (B, S*D)
+        din_pooled = self.domain_proj(din_combined)                 # (B, D)
+        # 4. Fusion MLP (replacement, not residual)
+        fused = self.fusion_mlp(
+            torch.cat([hyformer_pooled, din_pooled], dim=-1))       # (B, D)
+        return fused
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1413,17 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Real DIN + MLP fusion head (Alibaba KDD 2018 architecture). When
+        # True, after the HyFormer stack produces its pooled (B, D) output,
+        # a separate DINMLPHead computes a target-aware aggregation of the
+        # raw seq tokens (MLP-scored attention) and fuses with the HyFormer
+        # output via a 2-layer MLP that REPLACES the pooled vector before
+        # the classifier. Differs from exp/din-style in three ways: real
+        # MLP attention scoring (not softmax dot-product), candidate query
+        # is a single projection of item NS tokens (not multi-token + mean
+        # pool), and fusion via concat-then-MLP (not additive residual).
+        use_din_real: bool = False,
+        din_hidden_mult: int = 2,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1439,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_din_real = bool(use_din_real)
+        self.din_hidden_mult = int(din_hidden_mult)
 
         # ================== NS Tokens Construction ==================
 
@@ -1312,8 +1509,11 @@ class PCVRHyFormer(nn.Module):
             )
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+        # Track user/item split so the DIN head can slice item-side tokens.
+        # NS layout: [user_ns | user_dense_tok? | item_ns | item_dense_tok?].
+        self.num_user_ns_total = num_user_ns + (1 if self.has_user_dense else 0)
+        self.num_item_ns_total = num_item_ns + (1 if self.has_item_dense else 0)
+        self.num_ns = self.num_user_ns_total + self.num_item_ns_total
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1417,6 +1617,27 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
+
+        # ================== Real DIN + MLP fusion head (optional) ==================
+        # Applied AFTER output_proj produces the HyFormer pooled (B, D). When
+        # enabled, the DIN head computes a target-aware aggregation over the
+        # raw per-domain seq tokens (using item NS tokens as the candidate
+        # query) and fuses with hyformer_pooled via a 2-layer MLP that
+        # replaces the pooled vector consumed by the classifier.
+        if self.use_din_real:
+            self.din_head = DINMLPHead(
+                d_model=d_model,
+                num_sequences=self.num_sequences,
+                num_item_ns_total=self.num_item_ns_total,
+                hidden_mult=self.din_hidden_mult,
+                dropout=dropout_rate,
+            )
+            logging.info(
+                f"DIN + MLP head enabled: candidate from "
+                f"{self.num_item_ns_total} item NS tokens, MLP-scored "
+                f"attention over {self.num_sequences} raw seq domains, "
+                f"fusion MLP combines hyformer_pooled + din_pooled -> "
+                f"{d_model}-d replacement pooled (classifier input).")
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -1670,6 +1891,14 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
+        # 4b. Real DIN + MLP fusion head (optional).
+        # Replaces pooled output with a fusion of HyFormer pooled and a
+        # target-aware DIN-attention pooling over the raw per-domain seqs.
+        if self.use_din_real:
+            item_ns_slice = ns_tokens[:, self.num_user_ns_total:, :]
+            output = self.din_head(
+                output, item_ns_slice, seq_tokens_list, seq_masks_list)
+
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -1709,6 +1938,12 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        # DIN + MLP fusion (identical path to forward()).
+        if self.use_din_real:
+            item_ns_slice = ns_tokens[:, self.num_user_ns_total:, :]
+            output = self.din_head(
+                output, item_ns_slice, seq_tokens_list, seq_masks_list)
 
         logits = self.clsfier(output)
         return logits, output
