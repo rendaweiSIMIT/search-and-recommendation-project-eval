@@ -730,6 +730,79 @@ def _log_sample_table_tsv(sample: Dict[str, Any]) -> None:
             logging.info(f'KV  delay_{b}_pos\t{c_pos}')
 
 
+# ──────────────────────── Placeholder checkpoint save ───────────────────────
+
+
+def save_placeholder_checkpoint(
+    output_dir: str,
+    data_dir: str,
+    args_namespace,
+) -> str:
+    """Save a minimal placeholder checkpoint so the platform Model Management
+    UI lists this training run as a selectable model.
+
+    The eval-side infer.py on the ``exp/eda`` branch is also EDA-only and
+    does NOT load this checkpoint, but the platform's eval submission flow
+    requires picking a "model" from the dropdown -- the dropdown only
+    enumerates training runs that produced the canonical
+    ``global_step{N}.layer={L}.head={H}.hidden={D}.best_model/`` directory
+    pattern with at least ``model.pt`` + ``train_config.json`` inside.
+
+    Sidecar files written:
+      - ``model.pt``         : ``torch.save({}, ...)`` empty state_dict;
+                               infer.py never loads it on this branch.
+      - ``train_config.json``: a JSON dump of ``vars(args)`` plus a
+                               ``__eda_placeholder__: true`` marker so
+                               accidental loads on a non-EDA infer.py
+                               surface the right diagnostic message.
+      - ``schema.json``      : copied from ``$TRAIN_DATA_PATH/schema.json``
+                               if present, matching what
+                               ``trainer._write_sidecar_files`` does for
+                               real training runs.
+    """
+    import shutil
+    # Import torch lazily so eda.py can still run in environments where
+    # torch is missing (unlikely but the rest of EDA doesn't need it).
+    import torch
+
+    ckpt_dir_name = 'global_step1.layer=2.head=4.hidden=64.best_model'
+    ckpt_dir = os.path.join(output_dir, ckpt_dir_name)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # 1. Empty state_dict. Real eval would load model.pt; on this branch
+    #    eval-side infer.py skips the load entirely.
+    model_path = os.path.join(ckpt_dir, 'model.pt')
+    torch.save({}, model_path)
+
+    # 2. train_config.json. Mark as placeholder so any non-EDA infer.py
+    #    that tries to consume it gets an explicit signal.
+    cfg = {'__eda_placeholder__': True}
+    try:
+        cfg.update(vars(args_namespace))
+    except TypeError:
+        cfg['args_repr'] = repr(args_namespace)
+    with open(os.path.join(ckpt_dir, 'train_config.json'), 'w') as f:
+        json.dump(cfg, f, indent=2, default=str)
+
+    # 3. schema.json -- copy from data_dir if present (matches trainer.py
+    #    sidecar behavior so the eval container reconstructs feature
+    #    layouts identically).
+    schema_src = os.path.join(data_dir, 'schema.json')
+    if os.path.exists(schema_src):
+        shutil.copy2(schema_src, os.path.join(ckpt_dir, 'schema.json'))
+    else:
+        logging.warning(
+            f'schema.json not found at {schema_src}; placeholder ckpt '
+            f'will omit it. Eval-side infer.py on this branch does not '
+            f'consume schema.json, so this is informational only.')
+
+    logging.info(f'Wrote placeholder checkpoint to {ckpt_dir}')
+    logging.info(
+        '  files: model.pt (empty), train_config.json '
+        '(eda_placeholder marker), schema.json (copy from data_dir)')
+    return ckpt_dir
+
+
 # ─────────────────────────────── Entry point ────────────────────────────────
 
 def main() -> None:
@@ -770,6 +843,13 @@ def main() -> None:
         is_training=(args.mode == 'train'),
         max_files=args.max_files,
     )
+
+    # After EDA: drop a placeholder checkpoint so the platform's eval
+    # submission flow can select this training run. Only meaningful in
+    # train mode; the eval-side entry point invokes stream_eda directly
+    # and does not write a checkpoint.
+    if args.mode == 'train':
+        save_placeholder_checkpoint(args.output_dir, args.data_dir, args)
 
 
 if __name__ == '__main__':
