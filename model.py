@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -1229,6 +1229,18 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Conversion-delay auxiliary task. When True, adds a small MLP head
+        # that predicts ``log(label_time - timestamp)`` from the pooled
+        # representation. The aux MSE loss is only applied to positive
+        # samples in trainer.py and is gated by ``delay_aux_weight``. The
+        # head exists in the state_dict regardless, but is never consumed
+        # by the classifier output (no leakage at inference). EDA showed
+        # ``label_time`` has 1-D AUC 0.595, the strongest single signal in
+        # the dataset; this branch piggy-backs on that signal via multi-
+        # task learning (ESMM / MMOE family) since label_time itself is
+        # hidden in test data.
+        use_delay_aux: bool = False,
+        delay_aux_hidden_mult: int = 2,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1256,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_delay_aux = bool(use_delay_aux)
+        self.delay_aux_hidden_mult = int(delay_aux_hidden_mult)
 
         # ================== NS Tokens Construction ==================
 
@@ -1429,6 +1443,23 @@ class PCVRHyFormer(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, action_num)
         )
+
+        # ================== Conversion-delay aux head (optional) ==================
+        # 2-layer MLP that predicts log(label_time - timestamp) from the
+        # pooled vector. Trained only on positive samples via an MSE loss
+        # gated by ``delay_aux_weight`` in trainer.py. Output is never
+        # consumed by the classifier so the inference path is unchanged.
+        if self.use_delay_aux:
+            aux_hidden = d_model * self.delay_aux_hidden_mult
+            self.delay_head = nn.Sequential(
+                nn.Linear(d_model, aux_hidden),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(aux_hidden, 1),
+            )
+            logging.info(
+                f"Delay aux head enabled: pooled (B, {d_model}) -> "
+                f"{aux_hidden} -> 1 scalar (log-delay regression target).")
 
         # Initialize parameters
         self._init_params()
@@ -1631,8 +1662,27 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
+    def forward(
+        self,
+        inputs: ModelInput,
+        return_aux: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """Runs the forward pass of the PCVRHyFormer model.
+
+        Args:
+            inputs: ModelInput NamedTuple.
+            return_aux: when True and aux heads are enabled (e.g. use_delay_aux),
+                additionally return a dict of auxiliary outputs. Default False
+                keeps the call signature backward-compatible -- legacy callers
+                continue to receive just the (B, action_num) logits tensor.
+
+        Returns:
+            logits (B, action_num) when ``return_aux=False`` (default).
+            Tuple ``(logits, aux_dict)`` when ``return_aux=True``; aux_dict
+            may contain:
+              - ``delay_pred`` (B,): predicted log-delay, only present when
+                ``use_delay_aux=True``.
+        """
         # 1. NS tokens: grouped projection
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
@@ -1672,7 +1722,14 @@ class PCVRHyFormer(nn.Module):
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
-        return logits
+
+        if not return_aux:
+            return logits
+
+        aux: Dict[str, torch.Tensor] = {}
+        if self.use_delay_aux:
+            aux['delay_pred'] = self.delay_head(output).squeeze(-1)
+        return logits, aux
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""

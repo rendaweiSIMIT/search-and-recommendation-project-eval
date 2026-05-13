@@ -515,6 +515,27 @@ class PCVRParquetDataset(IterableDataset):
             labels = np.zeros(B, dtype=np.int64)
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
 
+        # ---- Conversion delay target (training-side only) ----
+        # ``label_time - timestamp`` is the post-click time at which the
+        # final label was determined. For positive samples (label_type == 2)
+        # this is the actual conversion delay; for negative samples it is
+        # the censoring time. Strongly predictive of the binary label
+        # (1-D AUC ~0.595 in our EDA report) but cannot be used as an
+        # input feature because ``label_time`` is hidden on test data.
+        # Instead we emit ``log_delay`` here and have ``trainer.py``
+        # consume it via an auxiliary MSE head (multi-task learning).
+        # During eval ``label_time`` columns are all zero, but the trainer
+        # only computes the delay loss when ``use_delay_aux`` is on AND
+        # there are positive samples, so the eval path is a strict no-op.
+        if self.is_training and 'label_time' in self._col_idx:
+            lt = (batch.column(self._col_idx['label_time']).fill_null(0)
+                  .to_numpy(zero_copy_only=False).astype(np.int64))
+            # max(.,1) guards against zero / negative deltas before log.
+            delay = np.maximum(lt - timestamps, 1)
+            log_delay = np.log(delay.astype(np.float64)).astype(np.float32)
+        else:
+            log_delay = np.zeros(B, dtype=np.float32)
+
         # ---- user_int: write into pre-allocated buffer ----
         # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
         # are treated the same as padding. Features with vs==0 have no vocab
@@ -577,6 +598,7 @@ class PCVRParquetDataset(IterableDataset):
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
+            'log_delay': torch.from_numpy(log_delay),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }

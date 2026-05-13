@@ -68,6 +68,13 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Delay aux head (exp/delay-aux). When True the model state_dict
+    # contains the small delay_head MLP (~2D*D + D*1 params); the flag
+    # must match training so state_dict load doesn't shape-mismatch.
+    # The head is never invoked at inference (forward() defaults to
+    # return_aux=False), so the eval pipeline is unaffected.
+    'use_delay_aux': False,
+    'delay_aux_hidden_mult': 2,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
