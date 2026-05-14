@@ -1229,6 +1229,19 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Explicit int-feature adapter (exp/feat-int-adapter family).
+        # Lists of (vocab_size, offset, length) tuples for user_int_feats /
+        # item_int_feats positions that get a dedicated d_model-wide
+        # embedding + MLP adapter, with the result added as a residual
+        # to the pooled output before the classifier. Same recipe the
+        # winning exp/pretrained-mixed branch used to surface fid 61 / 87
+        # from buried-in-NS-tokenizer to explicit. Empty default -> no-op,
+        # baseline behavior. EDA-driven candidates: item fid 13 (1-D
+        # AUC 0.561, signal 0.123) and user fid 1 (AUC 0.541, signal
+        # 0.082) -- both top scalar ints currently diluted by the
+        # RankMixer concat-and-split tokenizer.
+        explicit_user_int_specs: Tuple[Tuple[int, int, int], ...] = (),
+        explicit_item_int_specs: Tuple[Tuple[int, int, int], ...] = (),
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1257,13 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        # Normalize explicit-int specs to immutable tuples-of-tuples.
+        self.explicit_user_int_specs = tuple(
+            (int(vs), int(off), int(ln))
+            for (vs, off, ln) in explicit_user_int_specs)
+        self.explicit_item_int_specs = tuple(
+            (int(vs), int(off), int(ln))
+            for (vs, off, ln) in explicit_item_int_specs)
 
         # ================== NS Tokens Construction ==================
 
@@ -1430,6 +1450,40 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(d_model, action_num)
         )
 
+        # ================== Explicit int-feature adapters (optional) ==================
+        # For each (vocab_size, offset, length) spec, build a dedicated
+        # nn.Embedding(vocab+1, d_model, padding_idx=0) and a 1-layer
+        # adapter (Linear D -> D + LayerNorm). The lookup is at the
+        # specified offset/length slice of user_int_feats / item_int_feats
+        # (length>1 -> mean-pool with non-zero mask, matching the NS
+        # tokenizer's array-handling convention). All adapter outputs
+        # are summed into a residual that is added to the pooled output
+        # right before the classifier. Empty spec lists -> no-op.
+        self.explicit_user_int_embs = nn.ModuleList([
+            nn.Embedding(int(vs) + 1, d_model, padding_idx=0)
+            for (vs, _, _) in self.explicit_user_int_specs
+        ])
+        self.explicit_user_int_adapters = nn.ModuleList([
+            nn.Sequential(nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
+            for _ in self.explicit_user_int_specs
+        ])
+        self.explicit_item_int_embs = nn.ModuleList([
+            nn.Embedding(int(vs) + 1, d_model, padding_idx=0)
+            for (vs, _, _) in self.explicit_item_int_specs
+        ])
+        self.explicit_item_int_adapters = nn.ModuleList([
+            nn.Sequential(nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
+            for _ in self.explicit_item_int_specs
+        ])
+        if self.explicit_user_int_specs or self.explicit_item_int_specs:
+            logging.info(
+                f"Explicit int adapters enabled: "
+                f"{len(self.explicit_user_int_specs)} user-int specs "
+                f"{self.explicit_user_int_specs}, "
+                f"{len(self.explicit_item_int_specs)} item-int specs "
+                f"{self.explicit_item_int_specs}. Each contributes a "
+                f"{d_model}-d residual to the pooled output.")
+
         # Initialize parameters
         self._init_params()
 
@@ -1466,6 +1520,10 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        for emb in list(self.explicit_user_int_embs) + list(self.explicit_item_int_embs):
+            nn.init.xavier_normal_(emb.weight.data)
+            emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1631,6 +1689,43 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
+    def _apply_explicit_int_adapters(
+        self,
+        output: torch.Tensor,
+        user_int_feats: torch.Tensor,
+        item_int_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add per-fid dedicated-embedding residuals to the pooled output.
+
+        For each spec ``(vocab, offset, length)``, slice the int feats at
+        the given offset, look up the dedicated embedding, optionally
+        mean-pool (when length > 1, using a non-zero mask), pass through
+        the per-fid adapter (Linear + LN), and sum into ``output``.
+        No-op when both spec lists are empty.
+        """
+        if not (self.explicit_user_int_specs or self.explicit_item_int_specs):
+            return output
+
+        residual = torch.zeros_like(output)
+        for kind, specs, embs, adapters, feats in (
+            ('user', self.explicit_user_int_specs, self.explicit_user_int_embs,
+             self.explicit_user_int_adapters, user_int_feats),
+            ('item', self.explicit_item_int_specs, self.explicit_item_int_embs,
+             self.explicit_item_int_adapters, item_int_feats),
+        ):
+            for i, (_vs, offset, length) in enumerate(specs):
+                vals = feats[:, offset:offset + length].long()  # (B, length)
+                if length == 1:
+                    val = vals[:, 0]                            # (B,)
+                    emb = embs[i](val)                          # (B, D)
+                else:
+                    emb_all = embs[i](vals)                     # (B, length, D)
+                    mask = (vals != 0).float().unsqueeze(-1)    # (B, length, 1)
+                    count = mask.sum(dim=1).clamp(min=1)        # (B, 1)
+                    emb = (emb_all * mask).sum(dim=1) / count   # (B, D)
+                residual = residual + adapters[i](emb)
+        return output + residual
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -1669,6 +1764,11 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
+
+        # 4b. Explicit int-feature adapter residuals (no-op when spec
+        # lists are empty -> baseline behavior recovered).
+        output = self._apply_explicit_int_adapters(
+            output, inputs.user_int_feats, inputs.item_int_feats)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1709,6 +1809,9 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        output = self._apply_explicit_int_adapters(
+            output, inputs.user_int_feats, inputs.item_int_feats)
 
         logits = self.clsfier(output)
         return logits, output
