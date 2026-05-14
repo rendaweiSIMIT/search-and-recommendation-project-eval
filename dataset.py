@@ -706,8 +706,18 @@ def get_pcvr_data(
             rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
     total_rgs = len(rg_info)
 
-    n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
+    # ``valid_ratio == 0`` (or negative) -> no validation split, use 100% of
+    # the data for training. Returns ``valid_loader = None`` to signal this
+    # to the trainer, which then skips evaluate() / EarlyStopping and saves
+    # one checkpoint per epoch directly. Project convention as of 2026-05-13
+    # (see feedback_kdd_fixed_4_epoch).
+    no_val = valid_ratio <= 0
+    if no_val:
+        n_valid_rgs = 0
+        n_train_rgs = total_rgs
+    else:
+        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        n_train_rgs = total_rgs - n_valid_rgs
 
     # train_ratio: use only the first N% of the training Row Groups.
     if train_ratio < 1.0:
@@ -715,10 +725,16 @@ def get_pcvr_data(
         logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
     train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:]) if not no_val else 0
 
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+    if no_val:
+        logging.info(
+            f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+            f"NO VALIDATION (valid_ratio={valid_ratio}). Trainer will skip "
+            f"evaluate()/EarlyStopping and save one ckpt per epoch.")
+    else:
+        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                     f"{n_valid_rgs} valid ({valid_rows} rows)")
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -742,20 +758,23 @@ def get_pcvr_data(
         num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
     )
 
-    valid_dataset = PCVRParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_max_lens=seq_max_lens,
-        shuffle=False,
-        buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
-        clip_vocab=clip_vocab,
-    )
-    valid_loader = DataLoader(
-        valid_dataset, batch_size=None,
-        num_workers=0, pin_memory=use_cuda,
-    )
+    if no_val:
+        valid_loader = None
+    else:
+        valid_dataset = PCVRParquetDataset(
+            parquet_path=data_dir,
+            schema_path=schema_path,
+            batch_size=batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=False,
+            buffer_batches=0,
+            row_group_range=(n_train_rgs, total_rgs),
+            clip_vocab=clip_vocab,
+        )
+        valid_loader = DataLoader(
+            valid_dataset, batch_size=None,
+            num_workers=0, pin_memory=use_cuda,
+        )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
                  f"batch_size={batch_size}, buffer_batches={buffer_batches}")
