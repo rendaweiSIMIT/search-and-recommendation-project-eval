@@ -131,6 +131,13 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Hour-of-day bucket count for the optional per-event-hour seq token
+# enrichment (exp/event-hour-seq). Layout: 0 = padding, 1-24 = hour-of-day
+# values 0-23. Model side uses ``nn.Embedding(NUM_EVENT_HOURS,
+# padding_idx=0)`` so padding positions contribute a zero vector and
+# real events contribute a learned 24-class embedding.
+NUM_EVENT_HOURS = 25
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -220,12 +227,14 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_eh = {}    # per-token absolute hour-of-day (event_hour)
         self._buf_seq_lens = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_eh[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -630,6 +639,8 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            event_hour = self._buf_seq_eh[domain][:B]
+            event_hour[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -664,7 +675,24 @@ class PCVRParquetDataset(IterableDataset):
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
 
+                # ---- Per-event hour-of-day (exp/event-hour-seq) ----
+                # event_hour bucket layout: 0 = padding, 1-24 = hour-of-day 0-23.
+                # The +1 offset matches the time_bucket / time_embedding
+                # padding_idx=0 convention so padding positions emit a zero
+                # vector when looked up through nn.Embedding(NUM_EVENT_HOURS,
+                # padding_idx=0). The signal is "what time of day was this
+                # user event" -- a stable user-lifestyle trait that lives
+                # entirely inside the user's past behavior, so its
+                # distribution does not shift between train and the platform's
+                # Mon 00:01-01:30 test window (test users' historical events
+                # were collected in the same time range as training events).
+                hour_raw = (ts_padded // 3600) % 24
+                hours_plus1 = (hour_raw + 1).astype(np.int64)
+                hours_plus1[ts_padded == 0] = 0
+                event_hour[:] = hours_plus1
+
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_event_hour'] = torch.from_numpy(event_hour.copy())
 
         return result
 

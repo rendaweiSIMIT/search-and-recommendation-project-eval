@@ -68,6 +68,13 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Per-event hour-of-day enrichment (exp/event-hour-seq). When True
+    # the model state_dict contains an additional 25x64 embedding
+    # (event_hour_embedding) that is consumed by _embed_seq_domain.
+    # Fallback default is False so legacy ckpts keep loading on the
+    # baseline shape; exp/event-hour-seq ckpts override via
+    # train_config.json.
+    'use_event_hour': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -284,6 +291,7 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_event_hours: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -291,6 +299,8 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        if f'{domain}_event_hour' in device_batch:
+            seq_event_hours[domain] = device_batch[f'{domain}_event_hour']
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
@@ -300,6 +310,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_event_hours=seq_event_hours if seq_event_hours else None,
     )
 
 

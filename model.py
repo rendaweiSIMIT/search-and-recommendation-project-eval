@@ -16,6 +16,10 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Optional per-event hour-of-day (exp/event-hour-seq). Layout: 0 = pad,
+    # 1-24 = real hour 0-23 (matches dataset.py NUM_EVENT_HOURS=25 +
+    # padding_idx=0). None when the model is not consuming this signal.
+    seq_event_hours: Optional[dict] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1229,6 +1233,15 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Per-event hour-of-day enrichment for seq tokens (exp/event-hour-seq).
+        # When True, each seq token receives an additional additive embedding
+        # derived from the *event's own* hour-of-day (0-23). Captures the
+        # user's lifestyle / activity-time pattern as part of their past
+        # behavior. Critically this is NOT the sample-side hour-of-day
+        # (which has distribution shift between train and test) -- the
+        # signal lives inside the user's seq, where test and train share
+        # the same observation window so it transfers cleanly.
+        use_event_hour: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1257,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_event_hour = bool(use_event_hour)
 
         # ================== NS Tokens Construction ==================
 
@@ -1377,6 +1391,19 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        # ================== Per-event Hour-of-Day Embedding (optional) ==================
+        # 25 slots: 0 = padding, 1-24 = real hours 0-23 (matches
+        # dataset.NUM_EVENT_HOURS / dataset._convert_batch's offset+1
+        # encoding). padding_idx=0 forces padding positions to contribute
+        # a zero vector. Hour signal is added to each seq token alongside
+        # time_bucket inside _embed_seq_domain.
+        if self.use_event_hour:
+            self.event_hour_embedding = nn.Embedding(25, d_model, padding_idx=0)
+            logging.info(
+                "Per-event hour-of-day enrichment enabled: each seq token "
+                "gains an additive embedding from a 25-slot table "
+                "(0=padding, 1-24=hour 0-23).")
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1467,6 +1494,10 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        if self.use_event_hour:
+            nn.init.xavier_normal_(self.event_hour_embedding.weight.data)
+            self.event_hour_embedding.weight.data[0, :] = 0
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
@@ -1549,6 +1580,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        event_hour_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1570,6 +1602,13 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        # Add per-event hour-of-day embedding (padding_idx=0 zeros out
+        # padding positions). Same additive convention as time_bucket so
+        # the seq token's "what / when relatively / when absolutely on a
+        # 24h cycle" carries through downstream HyFormer cross-attention.
+        if self.use_event_hour and event_hour_ids is not None:
+            token_emb = token_emb + self.event_hour_embedding(event_hour_ids)
 
         return token_emb
 
@@ -1649,14 +1688,18 @@ class PCVRHyFormer(nn.Module):
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
         # 2. Embed each sequence domain (dynamic)
+        seq_event_hours = inputs.seq_event_hours
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
+            eh_ids = (seq_event_hours[domain]
+                      if seq_event_hours is not None else None)
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                event_hour_ids=eh_ids)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1691,14 +1734,18 @@ class PCVRHyFormer(nn.Module):
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
+        seq_event_hours = inputs.seq_event_hours
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
+            eh_ids = (seq_event_hours[domain]
+                      if seq_event_hours is not None else None)
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                event_hour_ids=eh_ids)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
