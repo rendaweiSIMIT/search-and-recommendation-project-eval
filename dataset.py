@@ -132,6 +132,34 @@ BUCKET_BOUNDARIES = np.array([
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
 
+# ─────────────────── Low-cardinality seq histogram specs ────────────────────
+#
+# exp/feat-low-card-seq-hist: 3 low-cardinality seq fids surfaced as top-11
+# 1-D AUC signals in the EDA (HANDOFF §4.6.5) but currently the baseline
+# treats them with the same seq tokenizer as ultra-high-cardinality id
+# columns. We compute a per-user normalized value histogram over each fid's
+# seq buffer and append the result to ``user_dense_feats`` so it flows
+# through the existing ``user_dense_proj`` without any model-side change.
+#
+# Each spec is ``(domain, fid, K)`` where the resulting vector has dim K
+# covering values 1..K (the value 0 represents padding and is excluded
+# from numerator; denominator is the non-pad count).
+LOW_CARD_HIST_SPECS = [
+    # domain, fid, K (= max value observed in EDA)
+    ('seq_c', 28, 72),  # signal 0.147, max=72 → 72-d vector
+    ('seq_a', 40, 18),  # signal 0.125, max=18 → 18-d vector
+    ('seq_c', 33,  4),  # signal 0.112, max=4  → 4-d  vector
+]
+LOW_CARD_HIST_TOTAL_DIM = sum(d for _, _, d in LOW_CARD_HIST_SPECS)  # 94
+
+# Synthetic user_dense fids reserved for the histogram features. Chosen
+# far above the real user_dense fid range (61, 62-66, 87, 89-91) so the
+# extended ``user_dense_schema`` cannot collide with real schema entries.
+# The mapping spec_index -> synth_fid is kept stable so train and eval
+# build the same schema layout.
+LOW_CARD_HIST_SYNTH_FIDS = [9128, 9140, 9133]
+
+
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
 
@@ -153,6 +181,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        use_low_card_seq_hist: bool = False,
     ) -> None:
         """
         Args:
@@ -170,8 +199,14 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            use_low_card_seq_hist: if True, compute a per-user normalized value
+                histogram over each ``LOW_CARD_HIST_SPECS`` fid and append it
+                to ``user_dense_feats``. The ``user_dense_schema`` is extended
+                with synthetic fids so ``user_dense_dim`` is reported correctly
+                to the model. See module-level constants for the specs.
         """
         super().__init__()
+        self.use_low_card_seq_hist: bool = use_low_card_seq_hist
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -295,6 +330,23 @@ class PCVRParquetDataset(IterableDataset):
         self.user_dense_schema: FeatureSchema = FeatureSchema()
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
+
+        # ---- Low-cardinality seq histogram synthetic dense entries ----
+        # exp/feat-low-card-seq-hist: append synthetic dense fids so that
+        # ``user_dense_schema.total_dim`` reports the post-histogram dim and
+        # ``model.user_dense_proj`` is sized correctly. Real schema.json is
+        # untouched; the histogram data is computed in _convert_batch from
+        # the seq buffer and written into the trailing positions of the
+        # user_dense numpy buffer.
+        if self.use_low_card_seq_hist:
+            for (_domain, _fid, k), synth_fid in zip(
+                    LOW_CARD_HIST_SPECS, LOW_CARD_HIST_SYNTH_FIDS):
+                self.user_dense_schema.add(synth_fid, k)
+            logging.info(
+                f"user_dense_schema extended with {len(LOW_CARD_HIST_SPECS)} "
+                f"low-card seq histogram fids "
+                f"({LOW_CARD_HIST_TOTAL_DIM} dims total); "
+                f"new total_dim={self.user_dense_schema.total_dim}")
 
         # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
@@ -666,6 +718,34 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+        # ---- Low-cardinality seq histograms (exp/feat-low-card-seq-hist) ----
+        # For each spec, count occurrences of each value k in 1..K within the
+        # seq buffer, normalize by the non-pad count, and write the K-d
+        # probability vector into the synthetic-fid region of user_dense. The
+        # spec_index -> synth_fid -> dense offset is established in
+        # _load_schema; we just look up the offset and fill.
+        if self.use_low_card_seq_hist:
+            for (domain, fid, k_max), synth_fid in zip(
+                    LOW_CARD_HIST_SPECS, LOW_CARD_HIST_SYNTH_FIDS):
+                if domain not in self._seq_plan:
+                    continue
+                try:
+                    slot = self.sideinfo_fids[domain].index(fid)
+                except ValueError:
+                    continue
+                vals = self._buf_seq[domain][:B, slot]  # (B, max_len)
+                # valid_count: non-pad positions per row. clip(min=1) so empty
+                # rows produce all-zero histograms (numerator is 0 anyway).
+                valid_count = (vals > 0).sum(axis=-1).astype(np.float32)
+                valid_count = np.maximum(valid_count, 1.0)
+                d_off, d_len = self.user_dense_schema.get_offset_length(synth_fid)
+                # d_len must equal k_max by construction in _load_schema.
+                for k in range(1, k_max + 1):
+                    count_k = (vals == k).sum(axis=-1).astype(np.float32)
+                    user_dense[:, d_off + (k - 1)] = count_k / valid_count
+            # Re-emit user_dense so the histogram fills are visible downstream.
+            result['user_dense_feats'] = torch.from_numpy(user_dense.copy())
+
         return result
 
 
@@ -681,6 +761,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    use_low_card_seq_hist: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -729,6 +810,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        use_low_card_seq_hist=use_low_card_seq_hist,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -751,6 +833,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        use_low_card_seq_hist=use_low_card_seq_hist,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

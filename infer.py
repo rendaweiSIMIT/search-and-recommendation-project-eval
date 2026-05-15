@@ -332,6 +332,13 @@ def main() -> None:
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
+    # exp/feat-low-card-seq-hist: when the ckpt was trained with histogram
+    # features, the eval-time PCVRParquetDataset must extend its
+    # user_dense_schema the same way so user_dense_dim matches the saved
+    # model.user_dense_proj input. Read the flag from train_config.json;
+    # missing -> baseline behavior.
+    use_low_card_seq_hist = bool(train_config.get('use_low_card_seq_hist', False))
+
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -340,6 +347,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        use_low_card_seq_hist=use_low_card_seq_hist,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
