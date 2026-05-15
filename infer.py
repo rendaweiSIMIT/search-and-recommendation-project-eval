@@ -68,6 +68,10 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # exp/seq-c47-id-hash: hash-trick rescue bucket size. 0 keeps the
+    # baseline skip behavior; >0 builds a hash table per high-card seq
+    # fid. train_config.json overrides this fallback.
+    'seq_hash_size': 0,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
