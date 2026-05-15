@@ -153,6 +153,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        time_of_day_filter: Optional[Tuple[int, int]] = None,
     ) -> None:
         """
         Args:
@@ -170,8 +171,17 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            time_of_day_filter: ``(start_sec, end_sec)`` seconds-of-day window
+                applied row-wise on the ``timestamp`` column (using
+                ``ts % 86400``). When ``start <= end`` the window is
+                ``[start, end]`` (a normal interval inside a single day).
+                When ``start > end`` the window wraps midnight and matches
+                ``[start, 86399] U [0, end]``. ``None`` keeps every row.
+                The EDA-confirmed test window is ``(85235, 4424)`` i.e.
+                Sun 23:40:35 -> Mon 01:13:44 (HANDOFF §1.6).
         """
         super().__init__()
+        self.time_of_day_filter: Optional[Tuple[int, int]] = time_of_day_filter
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -345,6 +355,19 @@ class PCVRParquetDataset(IterableDataset):
         for file_path, rg_idx, _ in rg_list:
             pf = pq.ParquetFile(file_path)
             for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
+                if self.time_of_day_filter is not None:
+                    ts_arr = batch.column(self._col_idx['timestamp']).to_numpy().astype(np.int64)
+                    sod = ts_arr % 86400
+                    lo, hi = self.time_of_day_filter
+                    # Cross-midnight: lo > hi means [lo, 86399] U [0, hi].
+                    if lo <= hi:
+                        mask_np = (sod >= lo) & (sod <= hi)
+                    else:
+                        mask_np = (sod >= lo) | (sod <= hi)
+                    if not mask_np.any():
+                        continue
+                    if not mask_np.all():
+                        batch = batch.filter(pa.array(mask_np))
                 batch_dict = self._convert_batch(batch)
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
@@ -681,6 +704,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    time_of_day_filter: Optional[Tuple[int, int]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -729,6 +753,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        time_of_day_filter=time_of_day_filter,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -751,6 +776,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        time_of_day_filter=time_of_day_filter,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
