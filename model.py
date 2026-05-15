@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -1083,6 +1083,7 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        paired_pool_map: Optional[Dict[int, Tuple[int, int]]] = None,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1093,6 +1094,13 @@ class RankMixerNSTokenizer(nn.Module):
             d_model: Output token dimension.
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            paired_pool_map: Optional dict mapping feature_specs index -> (dense_offset,
+                dense_length). When set, the multi-value lookup for that fid uses
+                ``softmax(signed_log1p(dense_slice))`` as per-position weights instead
+                of mean pooling, so the dataset's element-wise (int_id, dense_value)
+                alignment (e.g. user_int_feats_89 carrying category ids and
+                user_dense_feats_89 carrying their normalized affinity scores) is
+                preserved end-to-end.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1100,6 +1108,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.paired_pool_map: Dict[int, Tuple[int, int]] = dict(paired_pool_map or {})
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1144,12 +1153,26 @@ class RankMixerNSTokenizer(nn.Module):
             f"total_emb_dim={total_emb_dim}, chunk_dim={self.chunk_dim}, "
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
+        if self.paired_pool_map:
+            logging.info(
+                f"RankMixerNSTokenizer: paired pooling enabled for "
+                f"{len(self.paired_pool_map)} fid(s) "
+                f"(int_idx -> dense_slice): {sorted(self.paired_pool_map.items())}"
+            )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            dense_feats: (B, total_dense_dim) concatenated dense features.
+                Only consulted for fids listed in ``paired_pool_map``; if None
+                (or that fid is not paired) the lookup falls back to the
+                original mean-pooling path.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1169,9 +1192,31 @@ class RankMixerNSTokenizer(nn.Module):
                     else:
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        # Paired pooling: when this fid has an aligned dense slice
+                        # (e.g. (id, affinity_score) pairs for 89-91), use
+                        # signed_log1p(dense) as softmax logits over the seq dimension
+                        # so the pooled vector emphasizes high-weight categories.
+                        # Padding (id==0) is masked to -inf so it gets exactly zero
+                        # softmax weight; an all-padding row collapses softmax to
+                        # NaN, which we nan_to_num back to 0 so the pooled vector
+                        # becomes zero.
+                        if (dense_feats is not None
+                                and fid_idx in self.paired_pool_map):
+                            d_off, d_len = self.paired_pool_map[fid_idx]
+                            weights = dense_feats[:, d_off:d_off + d_len]  # (B, length)
+                            pad_mask = (vals == 0)  # (B, length); True at padding
+                            # signed log1p compresses both raw counters (1e8) and
+                            # already-normalized scores ([-1, 1]) onto a comparable
+                            # scale before softmax.
+                            logits = torch.sign(weights) * torch.log1p(torch.abs(weights))
+                            logits = logits.masked_fill(pad_mask, float('-inf'))
+                            attn = F.softmax(logits, dim=-1)  # (B, length)
+                            attn = torch.nan_to_num(attn, nan=0.0)
+                            fid_emb = (emb_all * attn.unsqueeze(-1)).sum(dim=1)
+                        else:
+                            mask = (vals != 0).float().unsqueeze(-1)
+                            count = mask.sum(dim=1).clamp(min=1)
+                            fid_emb = (emb_all * mask).sum(dim=1) / count
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1229,6 +1274,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Paired (int, dense) weighted pooling. On this branch we restrict
+        # paired pooling to fids 89-91 only (normalized affinity scores in
+        # [-0.92, 0.92], aligned 1:1 with user_int_feats_{89,90,91}). The
+        # other 5 documented pairs (62-66) fall back to baseline mean pool.
+        # The map keys are positional indices into ``user_int_feature_specs``
+        # (NOT raw fids); resolution from fid -> index happens in train.py /
+        # infer.py against the user_int / user_dense schemas.
+        user_paired_pool_map: Optional[Dict[int, Tuple[int, int]]] = None,
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1297,9 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        # Stored for forward() to know whether to thread user_dense_feats
+        # through the user-side tokenizer (None / empty -> baseline path).
+        self.user_paired_pool_map: Dict[int, Tuple[int, int]] = dict(user_paired_pool_map or {})
 
         # ================== NS Tokens Construction ==================
 
@@ -1280,6 +1336,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                paired_pool_map=self.user_paired_pool_map,
             )
             num_user_ns = user_ns_tokens
 
@@ -1633,8 +1690,13 @@ class PCVRHyFormer(nn.Module):
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
+        # 1. NS tokens: grouped projection. user_dense_feats is forwarded
+        #    so paired-pooling fids can replace mean pool with softmax-weighted
+        #    pool over the aligned dense slice.
+        user_dense_for_pool = (inputs.user_dense_feats
+                               if self.user_paired_pool_map else None)
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats,
+                                         user_dense_for_pool)     # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
@@ -1677,7 +1739,10 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        user_dense_for_pool = (inputs.user_dense_feats
+                               if self.user_paired_pool_map else None)
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats,
+                                         user_dense_for_pool)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
