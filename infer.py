@@ -68,6 +68,7 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'use_user_time_encoding': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -300,6 +301,8 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        sample_time_hour=device_batch.get('sample_time_hour'),
+        sample_time_weekday=device_batch.get('sample_time_weekday'),
     )
 
 

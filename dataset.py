@@ -570,6 +570,13 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # Sample-level calendar-time features derived from `timestamp`.
+        # See training-side dataset.py for the rationale; eval-side mirrors
+        # the same computation so that `_batch_to_model_input` in infer.py
+        # can plumb them into the model when ``use_user_time_encoding`` is on.
+        sample_time_hour = (((timestamps // 3600) % 24) + 1).astype(np.int64)
+        sample_time_weekday = (((timestamps // 86400) % 7) + 1).astype(np.int64)
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
@@ -577,6 +584,8 @@ class PCVRParquetDataset(IterableDataset):
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
+            'sample_time_hour': torch.from_numpy(sample_time_hour),
+            'sample_time_weekday': torch.from_numpy(sample_time_weekday),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }

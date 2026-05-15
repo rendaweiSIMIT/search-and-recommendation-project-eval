@@ -16,6 +16,12 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Sample-level calendar-time ids derived from the impression `timestamp`.
+    # 0 = padding/unknown; 1..24 = hour-of-day; 1..7 = weekday-period.
+    # Optional: when ``--use_user_time_encoding`` is off, dataset still fills
+    # these but the model ignores them (passes through unchanged).
+    sample_time_hour: Optional[torch.Tensor] = None        # (B,)
+    sample_time_weekday: Optional[torch.Tensor] = None     # (B,)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1229,6 +1235,10 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # User-side time encoding: derive (hour, weekday, sin/cos cyclical)
+        # from the impression timestamp and add a single d_model residual
+        # broadcast across all user NS tokens. Off by default.
+        use_user_time_encoding: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1302,6 +1312,37 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+
+        # ================== User-side sample-time encoding ==================
+        # Recipe (mirrors v9's per-seq encoding but applied on the impression
+        # timestamp, fed into the USER side only — never on seq tokens):
+        #   hour_emb     = LN(Embedding[25, D](hour_id))    # 0=pad, 1..24
+        #   weekday_emb  = LN(Embedding[8 , D](weekday_id)) # 0=pad, 1..7
+        #   cyc_emb      = LN(Linear(4, D)([sin(2π·h/24), cos(2π·h/24),
+        #                                  sin(2π·w/7),  cos(2π·w/7)]))
+        #   residual     = hour_emb + weekday_emb + cyc_emb           # (B, D)
+        #   user_ns      = user_ns + residual.unsqueeze(1)            # broadcast
+        #
+        # Why on the user side (not seq): all 6 v9 per-seq time features pile
+        # absolute hour/weekday signal onto every event in every sequence; on
+        # our data (test = Sun 23:40 → Mon 01:13, train has 0 rows in Mon)
+        # that risks 79% OOD on dow=0. Putting it on the user/sample side
+        # makes it a per-impression context vector. The sin/cos cyclical
+        # projection lets dow=0 (Mon) sit close to dow=6 (Sun) in feature
+        # space — the linear projection trained on Sun's heptagon-vertex
+        # generalizes to Mon's adjacent vertex, which a discrete embedding
+        # cannot.
+        self.use_user_time_encoding = use_user_time_encoding
+        if self.use_user_time_encoding:
+            self.sample_hour_embedding = nn.Embedding(25, d_model, padding_idx=0)
+            self.sample_weekday_embedding = nn.Embedding(8, d_model, padding_idx=0)
+            self.sample_cyclical_proj = nn.Linear(4, d_model, bias=False)
+            self.sample_time_norm = nn.LayerNorm(d_model)
+            nn.init.xavier_normal_(self.sample_hour_embedding.weight.data)
+            self.sample_hour_embedding.weight.data[0, :] = 0
+            nn.init.xavier_normal_(self.sample_weekday_embedding.weight.data)
+            self.sample_weekday_embedding.weight.data[0, :] = 0
+            nn.init.xavier_normal_(self.sample_cyclical_proj.weight.data)
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1631,11 +1672,47 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
+    def _make_sample_time_residual(
+        self,
+        hour_ids: torch.Tensor,
+        weekday_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build a (B, d_model) sample-time residual.
+
+        Sums three components (each LayerNorm'd) computed from per-sample
+        (hour, weekday): a discrete hour embedding, a discrete weekday
+        embedding, and a 4-D sin/cos cyclical projection. ``valid`` masks
+        out padded rows (hour_id==0) so they contribute zero. Result is
+        broadcast-added to user NS tokens by the caller.
+        """
+        hour_emb = self.sample_time_norm(self.sample_hour_embedding(hour_ids))
+        weekday_emb = self.sample_time_norm(self.sample_weekday_embedding(weekday_ids))
+
+        valid = (hour_ids != 0).to(dtype=hour_emb.dtype).unsqueeze(-1)  # (B, 1)
+        hour_float = (hour_ids.clamp_min(1) - 1).to(dtype=hour_emb.dtype)
+        weekday_float = (weekday_ids.clamp_min(1) - 1).to(dtype=hour_emb.dtype)
+        cyclical_features = torch.stack([
+            torch.sin(2 * math.pi * hour_float / 24.0),
+            torch.cos(2 * math.pi * hour_float / 24.0),
+            torch.sin(2 * math.pi * weekday_float / 7.0),
+            torch.cos(2 * math.pi * weekday_float / 7.0),
+        ], dim=-1)  # (B, 4)
+        cyclical_emb = self.sample_time_norm(
+            self.sample_cyclical_proj(cyclical_features) * valid)
+
+        return hour_emb + weekday_emb + cyclical_emb  # (B, d_model)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
+
+        # User-side sample-time injection (additive, broadcast over user NS tokens).
+        if self.use_user_time_encoding:
+            residual = self._make_sample_time_residual(
+                inputs.sample_time_hour, inputs.sample_time_weekday)  # (B, D)
+            user_ns = user_ns + residual.unsqueeze(1)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -1679,6 +1756,11 @@ class PCVRHyFormer(nn.Module):
         # Reuses forward logic but without dropout
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+
+        if self.use_user_time_encoding:
+            residual = self._make_sample_time_residual(
+                inputs.sample_time_hour, inputs.sample_time_weekday)
+            user_ns = user_ns + residual.unsqueeze(1)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
