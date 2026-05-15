@@ -68,6 +68,10 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    # Paired-pool branch: keys are positional indices into
+    # ``user_int_feature_specs`` (resolved from fid -> index in main()).
+    # Empty default keeps fallback path equivalent to baseline mean pool.
+    'user_paired_pool_map': {},
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -78,6 +82,58 @@ _FALLBACK_NUM_WORKERS = 16
 # Hyperparameter keys used to build the model. Everything else in
 # ``train_config.json`` is ignored when constructing ``PCVRHyFormer``.
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
+
+
+def _resolve_paired_pool_map(
+    pcvr_dataset: PCVRParquetDataset,
+    paired_pool_fids_str: str,
+) -> Dict[int, Tuple[int, int]]:
+    """Translate a comma-separated list of fids (e.g. "62,63,64,65,66")
+    into a mapping ``{user_int_position_index: (dense_offset, dense_length)}``
+    so that ``RankMixerNSTokenizer`` reconstructs the same paired-pool topology
+    that was active during training.
+
+    Mirrors ``_resolve_paired_pool_map`` in train.py exactly. A fid is admitted
+    only if (a) both schemas contain it and (b) the int-side and dense-side
+    slices have identical length (the element-wise alignment requirement).
+    Anything else degrades to a no-op for that fid.
+    """
+    if not paired_pool_fids_str:
+        return {}
+    try:
+        fids = [int(x.strip()) for x in paired_pool_fids_str.split(',') if x.strip()]
+    except ValueError:
+        logging.warning(f"Could not parse paired_pool_fids="
+                        f"{paired_pool_fids_str!r}, disabling")
+        return {}
+
+    int_schema = pcvr_dataset.user_int_schema
+    dense_schema = pcvr_dataset.user_dense_schema
+    int_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(int_schema.entries)}
+
+    paired_map: Dict[int, Tuple[int, int]] = {}
+    for fid in fids:
+        if fid not in int_fid_to_idx:
+            logging.warning(f"paired_pool_fids={fid} not in user_int_schema; skipping")
+            continue
+        if fid not in dense_schema._fid_to_entry:
+            logging.warning(f"paired_pool_fids={fid} not in user_dense_schema; skipping")
+            continue
+        int_idx = int_fid_to_idx[fid]
+        _, _, int_len = int_schema.entries[int_idx]
+        d_off, d_len = dense_schema.get_offset_length(fid)
+        if int_len != d_len:
+            logging.warning(
+                f"paired_pool_fids={fid}: int_len={int_len} != dense_len={d_len}, "
+                f"alignment broken; skipping")
+            continue
+        paired_map[int_idx] = (d_off, d_len)
+    if paired_map:
+        logging.info(
+            f"Paired pool resolved: requested fids={fids} "
+            f"(int_idx -> dense slice): {sorted(paired_map.items())}"
+        )
+    return paired_map
 
 
 def build_feature_specs(
@@ -346,6 +402,17 @@ def main() -> None:
 
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
+
+    # Paired-pool branch: train_config.json records the user-supplied fids
+    # as a comma-separated string (default for this branch "62,63,64,65,66");
+    # we resolve it against the schema here so the eval-time
+    # RankMixerNSTokenizer uses the exact same set of paired fids as during
+    # training. Empty / missing -> empty dict, which keeps the fallback
+    # identical to baseline.
+    model_cfg['user_paired_pool_map'] = _resolve_paired_pool_map(
+        test_dataset,
+        train_config.get('paired_pool_fids', ''),
+    )
 
     # ns_groups_json also comes from training config (e.g. run.sh may have
     # passed an empty string to disable it). When trainer.py has copied the
