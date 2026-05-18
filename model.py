@@ -1737,11 +1737,13 @@ class PCVRHyFormer(nn.Module):
             (int(o), int(l)) for o, l in gating_dense_offsets)
         self.has_additive_dense = bool(self.additive_dense_offsets)
         self.has_gating_dense = bool(self.gating_dense_offsets)
+        # exp/v9-mixed-dense-proj-full: the generic user-dense projection sees
+        # the FULL user_dense_feats -- nothing excluded, not even the 62-66
+        # pair region that v9 drops. fid 62-66 are then used both here and by
+        # UserSparseDensePairResidual; 61/87 both here and by their adapters.
+        # This restores the (maximally inclusive) behaviour of the original
+        # exp/pretrained-mixed +0.0039 winner on top of v9.
         self.user_dense_proj_dim = user_dense_dim
-        if user_dense_dim >= USER_DENSE_PAIR_END:
-            self.user_dense_proj_dim = (
-                user_dense_dim - (USER_DENSE_PAIR_END - USER_DENSE_PAIR_START)
-            )
 
         # ================== NS Tokens Construction ==================
 
@@ -2244,13 +2246,9 @@ class PCVRHyFormer(nn.Module):
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
     def _make_user_dense_proj_input(self, user_dense_feats: torch.Tensor) -> torch.Tensor:
-        """Drops fid62-66 dense values before the ordinary dense-token projection."""
-        if user_dense_feats.shape[1] < USER_DENSE_PAIR_END:
-            return user_dense_feats
-        return torch.cat([
-            user_dense_feats[:, :USER_DENSE_PAIR_START],
-            user_dense_feats[:, USER_DENSE_PAIR_END:],
-        ], dim=1)
+        """exp/v9-mixed-dense-proj-full: feed the full user_dense_feats into the
+        generic dense-token projection, excluding nothing (not even 62-66)."""
+        return user_dense_feats
 
     def _make_user_dense_token(
         self,
