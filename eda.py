@@ -67,16 +67,91 @@ def setup_logger(log_dir: Optional[str]) -> logging.Logger:
 # ────────────────────────── Sampling caps ────────────────────────────────────
 
 UNIQUE_CAP = 50_000          # max unique values to track per feature
-AUC_SAMPLE_CAP = 200_000     # max (value, label) pairs per feature for 1-D AUC
-LEN_SAMPLE_CAP = 50_000      # max sequence-length samples
+AUC_SAMPLE_CAP = 200_000     # max value samples per feature (drives AUC,
+                             # quantiles, frequency coverage, value->pos_rate)
+LEN_SAMPLE_CAP = 200_000     # max sequence-length samples
+FLAT_SAMPLE_CAP = 200_000    # max flat-value samples per array column
 DELAY_HIST_BINS = np.array(  # buckets for label_time - timestamp distribution
     [1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 86400], dtype=np.int64)
+
+# Quantile ladder reported per numeric column (and per array length).
+QUANTILES = (1, 5, 10, 25, 50, 75, 90, 95, 99)
+
+# A column with sampled cardinality <= this gets a full value->pos_rate
+# table (VPR lines): for low-card features the per-value conversion rate
+# is the single most actionable signal for embed-vs-numeric decisions.
+VPR_CARD_LIMIT = 64
+
+# Frequency-coverage ranks reported per int column (FRQ lines): "the top-K
+# most frequent values cover X fraction of all occurrences".
+FREQ_COVERAGE_RANKS = (1, 5, 10, 50, 100, 500, 1000, 5000)
 
 
 # ────────────────────────── Per-feature accumulators ─────────────────────────
 
+def _quantiles(arr: np.ndarray) -> Dict[str, float]:
+    """Compute the QUANTILES ladder from a sample array."""
+    if arr.size == 0:
+        return {f'p{p}': None for p in QUANTILES}
+    qs = np.percentile(arr, QUANTILES)
+    return {f'p{p}': float(q) for p, q in zip(QUANTILES, qs)}
+
+
+def _freq_coverage(values: np.ndarray) -> Dict[str, Any]:
+    """Frequency-concentration profile of an int value sample.
+
+    Returns the sampled cardinality, the cumulative coverage of the
+    top-K most-frequent values for each K in FREQ_COVERAGE_RANKS, and
+    the 20 most-common (value, fraction) pairs.
+    """
+    if values.size == 0:
+        return {}
+    vals, counts = np.unique(values, return_counts=True)
+    order = np.argsort(-counts)
+    counts_sorted = counts[order]
+    vals_sorted = vals[order]
+    total = float(counts_sorted.sum())
+    cumsum = np.cumsum(counts_sorted)
+    coverage = {}
+    for k in FREQ_COVERAGE_RANKS:
+        idx = min(k, len(cumsum)) - 1
+        coverage[k] = float(cumsum[idx] / total)
+    top = [(float(vals_sorted[i]), float(counts_sorted[i] / total))
+           for i in range(min(20, len(vals_sorted)))]
+    return {
+        'sampled_card': int(len(vals)),
+        'coverage': coverage,
+        'top20': top,
+    }
+
+
+def _value_pos_rate(
+    values: np.ndarray, labels: np.ndarray,
+) -> List[Tuple[float, int, float, float]]:
+    """Per-value (value, count, fraction, positive_rate) for a low-card column.
+
+    Only meaningful when the column has few distinct values; the caller
+    gates on VPR_CARD_LIMIT. Sorted by descending frequency.
+    """
+    vals, counts = np.unique(values, return_counts=True)
+    total = float(counts.sum())
+    rows: List[Tuple[float, int, float, float]] = []
+    for v, c in zip(vals, counts):
+        m = (values == v)
+        pos_rate = float(labels[m].mean()) if m.any() else 0.0
+        rows.append((float(v), int(c), float(c / total), pos_rate))
+    rows.sort(key=lambda t: -t[1])
+    return rows
+
+
 class ScalarAccum:
-    """Streaming stats for a scalar int / float column."""
+    """Streaming stats for a scalar int / float column.
+
+    Beyond basic moments it keeps a capped value sample (collected
+    unconditionally so eval-mode runs without labels still get
+    quantiles / frequency coverage) plus a parallel label sample for
+    1-D AUC and per-value positive-rate tables.
+    """
 
     def __init__(self, name: str, dtype_kind: str) -> None:
         self.name = name
@@ -84,11 +159,15 @@ class ScalarAccum:
         self.n_total = 0
         self.n_null = 0
         self.n_zero = 0
+        self.n_negative = 0
         self.minv = float('inf')
         self.maxv = float('-inf')
         self.sumv = 0.0
         self.sumsq = 0.0
+        self.sumcube = 0.0          # third moment -> skewness
         self.unique: set = set()
+        # Value sample is ALWAYS collected; label sample only when labels
+        # are present. _auc_l[i] pairs with _auc_v[i].
         self._auc_v: List[float] = []
         self._auc_l: List[int] = []
 
@@ -107,55 +186,85 @@ class ScalarAccum:
             non_null = values
         self.n_zero += int((values == 0).sum())
         if len(non_null) > 0:
+            self.n_negative += int((non_null < 0).sum())
             self.minv = min(self.minv, float(non_null.min()))
             self.maxv = max(self.maxv, float(non_null.max()))
             f = non_null.astype(np.float64)
             self.sumv += float(f.sum())
             self.sumsq += float((f * f).sum())
+            self.sumcube += float((f * f * f).sum())
             if len(self.unique) < UNIQUE_CAP:
                 space = UNIQUE_CAP - len(self.unique)
                 if self.dtype_kind in 'iu':
                     self.unique.update(non_null.astype(np.int64).tolist()[:space])
                 else:
                     self.unique.update(np.round(non_null, 4).tolist()[:space])
-        if labels is not None and len(self._auc_v) < AUC_SAMPLE_CAP:
+        # Unconditional value sample (quantiles / freq coverage need it even
+        # in eval mode); label sample only when labels exist.
+        if len(self._auc_v) < AUC_SAMPLE_CAP:
             space = AUC_SAMPLE_CAP - len(self._auc_v)
             take = min(n, space)
             self._auc_v.extend(values[:take].astype(np.float64).tolist())
-            self._auc_l.extend(labels[:take].astype(np.int64).tolist())
+            if labels is not None:
+                self._auc_l.extend(labels[:take].astype(np.int64).tolist())
 
     def finalize(self) -> Dict[str, Any]:
         n_valid = max(1, self.n_total - self.n_null)
         mean = self.sumv / n_valid
-        var = self.sumsq / n_valid - mean * mean
-        std = max(0.0, var) ** 0.5
+        m2 = self.sumsq / n_valid
+        m3 = self.sumcube / n_valid
+        var = max(0.0, m2 - mean * mean)
+        std = var ** 0.5
+        skew = 0.0
+        if std > 1e-12:
+            central3 = m3 - 3.0 * mean * m2 + 2.0 * mean ** 3
+            skew = central3 / (std ** 3)
         r: Dict[str, Any] = {
             'type': 'scalar',
             'n_total': self.n_total,
             'null_rate': self.n_null / max(1, self.n_total),
             'zero_rate': self.n_zero / max(1, self.n_total),
+            'negative_rate': self.n_negative / max(1, self.n_total),
             'min': None if self.minv == float('inf') else self.minv,
             'max': None if self.maxv == float('-inf') else self.maxv,
             'mean': mean,
             'std': std,
+            'skew': skew,
             'unique_sampled': len(self.unique),
             'unique_capped': len(self.unique) >= UNIQUE_CAP,
         }
-        if _HAS_SKLEARN and self._auc_v:
+        v = np.array(self._auc_v) if self._auc_v else np.array([])
+        # Quantile ladder.
+        r['quantiles'] = _quantiles(v)
+        # Frequency coverage (int columns only -- meaningless for continuous).
+        if self.dtype_kind in 'iu' and v.size > 0:
+            r['freq'] = _freq_coverage(v.astype(np.int64))
+        # 1-D AUC + low-card value->pos_rate.
+        if _HAS_SKLEARN and self._auc_l:
             try:
-                v = np.array(self._auc_v)
-                l = np.array(self._auc_l)
-                if len(np.unique(l)) >= 2 and len(np.unique(v)) >= 2:
-                    auc = float(roc_auc_score(l, v))
+                la = np.array(self._auc_l)
+                va = v[:len(la)]
+                if len(np.unique(la)) >= 2 and len(np.unique(va)) >= 2:
+                    auc = float(roc_auc_score(la, va))
                     r['auc_1d'] = auc
-                    r['auc_signal'] = abs(auc - 0.5) * 2  # 0=no signal, 1=perfect
+                    r['auc_signal'] = abs(auc - 0.5) * 2
+                # Per-value positive rate for low-cardinality columns.
+                distinct = np.unique(va)
+                if len(distinct) <= VPR_CARD_LIMIT:
+                    r['value_pos_rate'] = _value_pos_rate(va, la)
             except Exception as exc:  # pragma: no cover
                 r['auc_error'] = str(exc)
         return r
 
 
 class ArrayAccum:
-    """Streaming stats for a list<int> / list<float> column."""
+    """Streaming stats for a list<int> / list<float> column.
+
+    Tracks length distribution, flat-value distribution (min/max/zero/
+    negative rates plus a capped flat-value sample for quantiles and
+    frequency coverage) and three 1-D AUC proxies (mean / first-nonzero
+    / max pool).
+    """
 
     def __init__(self, name: str, dtype_kind: str) -> None:
         self.name = name
@@ -164,10 +273,14 @@ class ArrayAccum:
         self.n_empty = 0
         self.lens: List[int] = []
         self.flat_zero = 0
+        self.flat_negative = 0
         self.flat_count = 0
         self.minv = float('inf')
         self.maxv = float('-inf')
+        self.flat_sum = 0.0
+        self.flat_sumsq = 0.0
         self.unique: set = set()
+        self._flat_sample: List[float] = []   # capped flat-value sample
         self._auc_mean_v: List[float] = []
         self._auc_first_v: List[float] = []
         self._auc_max_v: List[float] = []
@@ -182,7 +295,22 @@ class ArrayAccum:
     ) -> None:
         """offsets has shape (n_rows+1,) and flat_values are the concatenated lists."""
         self.n_total += n_rows
-        # Per-row iteration; pyarrow already gave us a flat buffer so this is cheap.
+
+        # ---- Batch-level flat-value stats (vectorized over the whole RG) ----
+        if flat_values.size > 0:
+            self.flat_count += int(flat_values.size)
+            self.flat_zero += int((flat_values == 0).sum())
+            self.flat_negative += int((flat_values < 0).sum())
+            ff = flat_values.astype(np.float64)
+            self.flat_sum += float(ff.sum())
+            self.flat_sumsq += float((ff * ff).sum())
+            self.minv = min(self.minv, float(flat_values.min()))
+            self.maxv = max(self.maxv, float(flat_values.max()))
+            if len(self._flat_sample) < FLAT_SAMPLE_CAP:
+                space = FLAT_SAMPLE_CAP - len(self._flat_sample)
+                self._flat_sample.extend(ff[:space].tolist())
+
+        # ---- Per-row iteration: lengths, cardinality, AUC proxies ----
         for i in range(n_rows):
             s = int(offsets[i])
             e = int(offsets[i + 1])
@@ -198,13 +326,6 @@ class ArrayAccum:
             arr = flat_values[s:e]
             if len(self.lens) < LEN_SAMPLE_CAP:
                 self.lens.append(ln)
-            # flat-value stats (avoid full Python iteration -- use numpy reductions)
-            self.flat_count += ln
-            self.flat_zero += int((arr == 0).sum())
-            a_min = float(arr.min())
-            a_max = float(arr.max())
-            self.minv = min(self.minv, a_min)
-            self.maxv = max(self.maxv, a_max)
             # unique sampling: capped, only take a few values per row to limit cost
             if len(self.unique) < UNIQUE_CAP:
                 space = UNIQUE_CAP - len(self.unique)
@@ -219,11 +340,14 @@ class ArrayAccum:
                 self._auc_mean_v.append(float(arr.mean()))
                 nz = arr[arr != 0]
                 self._auc_first_v.append(float(nz[0]) if len(nz) > 0 else 0.0)
-                self._auc_max_v.append(a_max)
+                self._auc_max_v.append(float(arr.max()))
                 self._auc_l.append(int(labels[i]))
 
     def finalize(self) -> Dict[str, Any]:
         len_arr = np.array(self.lens) if self.lens else np.array([0])
+        flat_mean = self.flat_sum / max(1, self.flat_count)
+        flat_var = max(0.0, self.flat_sumsq / max(1, self.flat_count)
+                       - flat_mean * flat_mean)
         r: Dict[str, Any] = {
             'type': 'array',
             'n_total': self.n_total,
@@ -233,12 +357,23 @@ class ArrayAccum:
             'len_mean': float(len_arr.mean()),
             'len_p50': float(np.median(len_arr)),
             'len_p95': float(np.percentile(len_arr, 95)),
+            # Full length-quantile ladder (decides per-domain truncation).
+            'len_quantiles': _quantiles(len_arr.astype(np.float64)),
             'value_min': None if self.minv == float('inf') else self.minv,
             'value_max': None if self.maxv == float('-inf') else self.maxv,
+            'value_mean': flat_mean,
+            'value_std': flat_var ** 0.5,
             'flat_zero_rate': self.flat_zero / max(1, self.flat_count),
+            'flat_negative_rate': self.flat_negative / max(1, self.flat_count),
             'unique_sampled': len(self.unique),
             'unique_capped': len(self.unique) >= UNIQUE_CAP,
         }
+        fv = np.array(self._flat_sample) if self._flat_sample else np.array([])
+        # Flat-value quantile ladder.
+        r['value_quantiles'] = _quantiles(fv)
+        # Frequency coverage of flat values (int arrays only).
+        if self.dtype_kind in 'iu' and fv.size > 0:
+            r['freq'] = _freq_coverage(fv.astype(np.int64))
         if _HAS_SKLEARN and self._auc_l:
             try:
                 l = np.array(self._auc_l)
@@ -512,6 +647,7 @@ def stream_eda(
             'unique_cap': UNIQUE_CAP,
             'auc_sample_cap': AUC_SAMPLE_CAP,
             'len_sample_cap': LEN_SAMPLE_CAP,
+            'flat_sample_cap': FLAT_SAMPLE_CAP,
         },
         'sample_stats': sample_accum.finalize(),
         'features': feature_report,
@@ -629,6 +765,12 @@ def _log_summary(report: Dict[str, Any]) -> None:
     # to download the JSON). Lines are prefixed with "TSV" so a single
     # ``grep '^TSV ' eda.log`` extracts a clean table.
     _log_feature_table_tsv(feats)
+    # Detail blocks: quantile ladder, frequency coverage, low-card
+    # value->pos_rate. Each uses its own grep-able line prefix so the
+    # whole EDA result is recoverable from the log alone.
+    _log_quantile_lines(feats)
+    _log_frequency_lines(feats)
+    _log_value_posrate_lines(feats)
     # Likewise dump the sample-level histograms / delay distribution as
     # KV lines that are easy to copy/paste back.
     _log_sample_table_tsv(s)
@@ -655,7 +797,8 @@ def _log_feature_table_tsv(features: Dict[str, Any]) -> None:
     logging.info('==== FULL FEATURE TABLE (lines prefixed with "TSV ") ====')
     logging.info(
         'TSV  name\tkind\tdtype\tn_total\tnull_rate\tzero_or_empty_rate\t'
-        'min\tmax\tmean\tstd\tunique_sampled\tunique_capped\t'
+        'negative_rate\tmin\tmax\tmean\tstd\tskew\tp1\tp50\tp99\t'
+        'unique_sampled\tunique_capped\t'
         'len_mean\tlen_p95\tlen_max\tflat_zero_rate\t'
         'auc_1d_or_best\tauc_signal\tauc_via_mean\tauc_via_first_nz\tauc_via_max')
     # Sort by AUC signal (descending) so the most predictive features
@@ -673,10 +816,18 @@ def _log_feature_table_tsv(features: Dict[str, Any]) -> None:
         null_rate = v.get('null_rate', 0)
         # scalars expose zero_rate, arrays expose empty_rate -- merge into one column
         zoer = v.get('zero_rate', v.get('empty_rate', None))
+        # scalars expose negative_rate, arrays expose flat_negative_rate
+        neg = v.get('negative_rate', v.get('flat_negative_rate', None))
         mn = v.get('min', v.get('value_min', None))
         mx = v.get('max', v.get('value_max', None))
-        mean = v.get('mean', None)
-        std = v.get('std', None)
+        mean = v.get('mean', v.get('value_mean', None))
+        std = v.get('std', v.get('value_std', None))
+        skew = v.get('skew', None)
+        # quantile ladder: scalars in 'quantiles', arrays in 'value_quantiles'
+        qd = v.get('quantiles', v.get('value_quantiles', {})) or {}
+        p1 = qd.get('p1')
+        p50 = qd.get('p50')
+        p99 = qd.get('p99')
         uniq = v.get('unique_sampled', None)
         uniq_capped = v.get('unique_capped', None)
         len_mean = v.get('len_mean', None)
@@ -690,11 +841,89 @@ def _log_feature_table_tsv(features: Dict[str, Any]) -> None:
         auc_max = v.get('auc_via_max')
         logging.info(
             f'TSV  {name}\t{kind}\t{dtype}\t{n_total}\t{_fmt(null_rate)}\t'
-            f'{_fmt(zoer)}\t{_fmt(mn)}\t{_fmt(mx)}\t{_fmt(mean)}\t{_fmt(std)}\t'
+            f'{_fmt(zoer)}\t{_fmt(neg)}\t{_fmt(mn)}\t{_fmt(mx)}\t{_fmt(mean)}\t'
+            f'{_fmt(std)}\t{_fmt(skew)}\t{_fmt(p1)}\t{_fmt(p50)}\t{_fmt(p99)}\t'
             f'{_fmt(uniq)}\t{_fmt(uniq_capped)}\t'
             f'{_fmt(len_mean)}\t{_fmt(len_p95)}\t{_fmt(len_max)}\t'
             f'{_fmt(flat_zero)}\t{_fmt(auc_main)}\t{_fmt(sig)}\t'
             f'{_fmt(auc_mean)}\t{_fmt(auc_first)}\t{_fmt(auc_max)}')
+
+
+def _log_quantile_lines(features: Dict[str, Any]) -> None:
+    """Emit one ``QTL`` line per numeric column with the full quantile ladder.
+
+    For scalars: one line, kind=scalar-value.
+    For arrays:  two lines -- kind=array-value (flat-value quantiles) and
+    kind=array-len (sequence-length quantiles).
+    Recover via ``grep '^QTL '``.
+    """
+    logging.info('')
+    logging.info('==== QUANTILE LADDER (lines prefixed with "QTL ") ====')
+    cols = '\t'.join(f'p{p}' for p in QUANTILES)
+    logging.info(f'QTL  name\tkind\tmin\tmax\tmean\tstd\tskew\t{cols}')
+    for name, v in sorted(features.items()):
+        kind = v.get('column_kind', '?')
+        if kind == 'scalar':
+            qd = v.get('quantiles', {}) or {}
+            row = '\t'.join(_fmt(qd.get(f'p{p}')) for p in QUANTILES)
+            logging.info(
+                f'QTL  {name}\tscalar-value\t{_fmt(v.get("min"))}\t'
+                f'{_fmt(v.get("max"))}\t{_fmt(v.get("mean"))}\t'
+                f'{_fmt(v.get("std"))}\t{_fmt(v.get("skew"))}\t{row}')
+        elif kind == 'array':
+            qv = v.get('value_quantiles', {}) or {}
+            rowv = '\t'.join(_fmt(qv.get(f'p{p}')) for p in QUANTILES)
+            logging.info(
+                f'QTL  {name}\tarray-value\t{_fmt(v.get("value_min"))}\t'
+                f'{_fmt(v.get("value_max"))}\t{_fmt(v.get("value_mean"))}\t'
+                f'{_fmt(v.get("value_std"))}\t\t{rowv}')
+            ql = v.get('len_quantiles', {}) or {}
+            rowl = '\t'.join(_fmt(ql.get(f'p{p}')) for p in QUANTILES)
+            logging.info(
+                f'QTL  {name}\tarray-len\t{_fmt(v.get("len_min"))}\t'
+                f'{_fmt(v.get("len_max"))}\t{_fmt(v.get("len_mean"))}\t\t\t{rowl}')
+
+
+def _log_frequency_lines(features: Dict[str, Any]) -> None:
+    """Emit one ``FRQ`` line per int column: sampled cardinality + the
+    cumulative coverage of the top-K most frequent values, plus the 20
+    most-common (value:fraction) pairs. Recover via ``grep '^FRQ '``.
+    """
+    logging.info('')
+    logging.info('==== FREQUENCY COVERAGE (lines prefixed with "FRQ ") ====')
+    cov_cols = '\t'.join(f'top{k}' for k in FREQ_COVERAGE_RANKS)
+    logging.info(f'FRQ  name\tsampled_card\t{cov_cols}\tmost_common(value:frac x20)')
+    for name, v in sorted(features.items()):
+        fr = v.get('freq')
+        if not fr:
+            continue
+        cov = fr.get('coverage', {})
+        cov_row = '\t'.join(_fmt(cov.get(k)) for k in FREQ_COVERAGE_RANKS)
+        top = fr.get('top20', [])
+        top_str = ' '.join(f'{_fmt(val)}:{_fmt(frac)}' for val, frac in top)
+        logging.info(
+            f'FRQ  {name}\t{fr.get("sampled_card")}\t{cov_row}\t{top_str}')
+
+
+def _log_value_posrate_lines(features: Dict[str, Any]) -> None:
+    """Emit ``VPR`` lines for low-cardinality columns: per distinct value,
+    the (count, fraction, positive_rate). This is the single most
+    actionable signal for embed-vs-numeric. Recover via ``grep '^VPR '``.
+    Only emitted in train mode (needs labels).
+    """
+    has_any = any('value_pos_rate' in v for v in features.values())
+    if not has_any:
+        return
+    logging.info('')
+    logging.info('==== LOW-CARD VALUE -> POS_RATE (lines prefixed with "VPR ") ====')
+    logging.info('VPR  name\tvalue\tcount\tfrac\tpos_rate')
+    for name, v in sorted(features.items()):
+        rows = v.get('value_pos_rate')
+        if not rows:
+            continue
+        for val, cnt, frac, pos_rate in rows:
+            logging.info(
+                f'VPR  {name}\t{_fmt(val)}\t{cnt}\t{_fmt(frac)}\t{_fmt(pos_rate)}')
 
 
 def _log_sample_table_tsv(sample: Dict[str, Any]) -> None:
