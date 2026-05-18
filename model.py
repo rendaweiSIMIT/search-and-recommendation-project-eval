@@ -1694,6 +1694,21 @@ class PCVRHyFormer(nn.Module):
         # Inter-event time gap embedding
         use_time_gap: bool = False,
         user_sparse_dense_pair_specs: Optional[List[Tuple[int, int, int, int, int]]] = None,
+        # Paper-faithful integration of pretrained user embeddings (our
+        # exp/pretrained-mixed +0.0039 winner, ported onto v9). The dataset
+        # README documents user_dense_feats_61 as Meta's SUM embedding and
+        # user_dense_feats_87 as Tencent's LFM4Ads embedding. Each paper
+        # validates a different downstream-integration recipe:
+        #   * SUM (Meta): additional feature -> additive residual.
+        #   * LFM4Ads (Tencent): non-linear interaction (Eq 3-4) -> gating.
+        # Slices listed in `additive_dense_offsets` get an additive
+        # residual; slices in `gating_dense_offsets` get a multiplicative
+        # gate. Both operate on the pooled output right before the
+        # classifier:  output' = output * gate + residual.
+        # v9 itself never special-cases fid 61/87 (its UserSparseDensePair
+        # only covers 62-66), so this path is orthogonal to v9.
+        additive_dense_offsets: Tuple[Tuple[int, int], ...] = (),
+        gating_dense_offsets: Tuple[Tuple[int, int], ...] = (),
     ) -> None:
         super().__init__()
 
@@ -1715,6 +1730,13 @@ class PCVRHyFormer(nn.Module):
         self.use_target_attention = use_target_attention
         self.use_temporal_bias = use_temporal_bias
         self.use_time_gap = use_time_gap
+        # Paper-faithful pretrained dense paths (exp/pretrained-mixed port).
+        self.additive_dense_offsets = tuple(
+            (int(o), int(l)) for o, l in additive_dense_offsets)
+        self.gating_dense_offsets = tuple(
+            (int(o), int(l)) for o, l in gating_dense_offsets)
+        self.has_additive_dense = bool(self.additive_dense_offsets)
+        self.has_gating_dense = bool(self.gating_dense_offsets)
         self.user_dense_proj_dim = user_dense_dim
         if user_dense_dim >= USER_DENSE_PAIR_END:
             self.user_dense_proj_dim = (
@@ -2020,6 +2042,34 @@ class PCVRHyFormer(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, action_num)
         )
+
+        # ============ Paper-Faithful Pretrained Adapters (mixed port) ============
+        # Two independent 2-layer adapters: one for the additive (SUM, fid 61)
+        # path and one for the gating (LFM4Ads, fid 87) path. Either may be
+        # empty -> that path becomes a no-op and the model is v9-equivalent.
+        adapter_hidden = d_model * 2
+        if self.has_additive_dense:
+            additive_dim = sum(length for _, length in self.additive_dense_offsets)
+            self.user_additive_adapter = nn.Sequential(
+                nn.Linear(additive_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-additive (SUM-style): {additive_dim}-d "
+                f"(offsets={self.additive_dense_offsets}) -> {d_model}-d adapter")
+        if self.has_gating_dense:
+            gating_dim = sum(length for _, length in self.gating_dense_offsets)
+            self.user_gating_adapter = nn.Sequential(
+                nn.Linear(gating_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"Pretrained-gating (LFM4Ads-style): {gating_dim}-d "
+                f"(offsets={self.gating_dense_offsets}) -> {d_model}-d adapter")
 
         # Initialize parameters
         self._init_params()
@@ -2417,6 +2467,36 @@ class PCVRHyFormer(nn.Module):
         ns_out = curr_ns if self.use_ns_output_fusion else None
         return output, ns_out
 
+    def _apply_pretrained_paths(
+        self, output: torch.Tensor, user_dense_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Combine SUM-style additive residual and LFM4Ads-style gating.
+
+            output' = output * gate + residual
+
+        where ``gate = 2*sigmoid(adapter_lfm(user_dense[gating_offsets]))``
+        and ``residual = adapter_sum(user_dense[additive_offsets])``.
+        Either path can be disabled (no-op) by passing empty offsets.
+        Ported verbatim from our exp/pretrained-mixed +0.0039 winner.
+        """
+        gate = None
+        residual = None
+        if self.has_gating_dense:
+            slices = [user_dense_feats[:, off:off + length]
+                      for off, length in self.gating_dense_offsets]
+            x = torch.cat(slices, dim=-1)  # (B, sum_lfm_dim)
+            gate = 2.0 * torch.sigmoid(self.user_gating_adapter(x))
+        if self.has_additive_dense:
+            slices = [user_dense_feats[:, off:off + length]
+                      for off, length in self.additive_dense_offsets]
+            x = torch.cat(slices, dim=-1)  # (B, sum_sum_dim)
+            residual = self.user_additive_adapter(x)
+        if gate is not None:
+            output = output * gate
+        if residual is not None:
+            output = output + residual
+        return output
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -2494,6 +2574,9 @@ class PCVRHyFormer(nn.Module):
             output = self._apply_target_match_residual(
                 output, item_repr, seq_tokens_list, seq_masks_list)
 
+        # 7b. Paper-faithful pretrained-embedding paths (exp/pretrained-mixed)
+        output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
+
         # 7. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -2568,6 +2651,9 @@ class PCVRHyFormer(nn.Module):
         if self.use_target_attention:
             output = self._apply_target_match_residual(
                 output, item_repr, seq_tokens_list, seq_masks_list)
+
+        # Paper-faithful pretrained-embedding paths (exp/pretrained-mixed)
+        output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
 
         logits = self.clsfier(output)
         return logits, output

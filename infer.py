@@ -91,6 +91,12 @@ _FALLBACK_MODEL_CFG = {
     "use_ns_output_fusion": False,
     "use_temporal_bias": False,
     "use_time_gap": False,
+
+    # Paper-faithful pretrained-embedding paths (exp/pretrained-mixed port).
+    # Empty defaults -> no-op (v9-equivalent). New ckpts carry the resolved
+    # (offset, length) slice tuples in train_config.json and override.
+    "additive_dense_offsets": (),
+    "gating_dense_offsets": (),
 }
 
 _FALLBACK_SEQ_MAX_LENS = "seq_a:256,seq_b:256,seq_c:512,seq_d:512"
