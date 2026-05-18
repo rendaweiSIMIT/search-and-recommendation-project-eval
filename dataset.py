@@ -131,6 +131,17 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Inter-event gap bucket boundaries, following a coarser human-time scale than
+# the recency buckets above.  These buckets describe time between adjacent
+# historical behaviors inside one sequence.
+TIME_SPAN_BUCKET_BOUNDARIES = np.array([
+    30, 60, 180, 300, 600, 900, 1800, 3600,
+    10800, 21600, 43200, 86400, 172800, 345600, 604800,
+], dtype=np.int64)
+
+# Includes padding=0 plus all np.searchsorted buckets after +1.
+NUM_TIME_SPAN_BUCKETS = len(TIME_SPAN_BUCKET_BOUNDARIES) + 2
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -220,12 +231,22 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_td = {}
+        self._buf_seq_tg = {}
+        self._buf_seq_hour = {}
+        self._buf_seq_weekday = {}
+        self._buf_seq_span = {}
         self._buf_seq_lens = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_td[domain] = np.zeros((B, max_len), dtype=np.float32)
+            self._buf_seq_tg[domain] = np.zeros((B, max_len), dtype=np.float32)
+            self._buf_seq_hour[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_weekday[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_span[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -247,8 +268,12 @@ class PCVRParquetDataset(IterableDataset):
         offset = 0
         for fid, dim in self._user_dense_cols:
             ci = self._col_idx.get(f'user_dense_feats_{fid}')
-            self._user_dense_plan.append((ci, dim, offset))
+            self._user_dense_plan.append((ci, dim, offset, fid))
             offset += dim
+
+        # Fids whose dense values are raw statistics (not pre-trained embeddings)
+        # and benefit from log1p compression.
+        self._dense_log_fids: set = {62, 63, 64, 65, 66}
 
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
@@ -565,9 +590,11 @@ class PCVRParquetDataset(IterableDataset):
         # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]
         user_dense[:] = 0
-        for ci, dim, offset in self._user_dense_plan:
+        for ci, dim, offset, fid in self._user_dense_plan:
             col = batch.column(ci)
             padded = self._pad_varlen_float_column(col, dim, B)
+            if fid in self._dense_log_fids:
+                padded = np.sign(padded) * np.log1p(np.abs(padded))
             user_dense[:, offset:offset + dim] = padded
 
         result = {
@@ -665,6 +692,63 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+
+            # Raw log-compressed time deltas for Temporal Attention Bias.
+            time_delta = self._buf_seq_td[domain][:B]
+            time_delta[:] = 0.0
+            if ts_ci is not None:
+                td_float = np.log1p(time_diff.astype(np.float32) / 3600.0)
+                td_float[ts_padded == 0] = 0.0
+                time_delta[:] = td_float
+            result[f'{domain}_time_delta'] = torch.from_numpy(time_delta.copy())
+
+            # Inter-event gap: time between adjacent behaviors in sequence.
+            time_gap = self._buf_seq_tg[domain][:B]
+            time_gap[:] = 0.0
+            if ts_ci is not None:
+                # ts_padded is in descending order, so gap[i] = ts[i] - ts[i+1]
+                gaps = np.zeros((B, max_len), dtype=np.float32)
+                gaps[:, :-1] = (ts_padded[:, :-1] - ts_padded[:, 1:]).astype(np.float32)
+                gaps[gaps < 0] = 0.0
+                gaps[ts_padded == 0] = 0.0
+                # Also zero out the position right before padding starts
+                for i in range(B):
+                    l = int(lengths[i])
+                    if l > 0 and l < max_len:
+                        gaps[i, l - 1] = 0.0
+                time_gap[:] = np.log1p(gaps / 60.0)  # convert to minutes + log compress
+            result[f'{domain}_time_gap'] = torch.from_numpy(time_gap.copy())
+
+            # Calendar-time ids from the event timestamp itself.  0 remains
+            # padding; valid hours are 1..24 and valid weekdays are 1..7.
+            time_hour = self._buf_seq_hour[domain][:B]
+            time_weekday = self._buf_seq_weekday[domain][:B]
+            time_hour[:] = 0
+            time_weekday[:] = 0
+            if ts_ci is not None:
+                valid_ts = ts_padded > 0
+                hour_ids = ((ts_padded // 3600) % 24 + 1).astype(np.int64)
+                weekday_ids = ((ts_padded // 86400) % 7 + 1).astype(np.int64)
+                hour_ids[~valid_ts] = 0
+                weekday_ids[~valid_ts] = 0
+                time_hour[:] = hour_ids
+                time_weekday[:] = weekday_ids
+            result[f'{domain}_time_hour'] = torch.from_numpy(time_hour.copy())
+            result[f'{domain}_time_weekday'] = torch.from_numpy(time_weekday.copy())
+
+            # Discrete inter-event gap bucket, complementary to the continuous
+            # log-compressed time_gap above.
+            time_span = self._buf_seq_span[domain][:B]
+            time_span[:] = 0
+            if ts_ci is not None:
+                raw_span_buckets = np.searchsorted(
+                    TIME_SPAN_BUCKET_BOUNDARIES,
+                    gaps.astype(np.int64).ravel(),
+                )
+                span_ids = raw_span_buckets.reshape(B, max_len) + 1
+                span_ids[gaps <= 0] = 0
+                time_span[:] = span_ids
+            result[f'{domain}_time_span_bucket'] = torch.from_numpy(time_span.copy())
 
         return result
 

@@ -16,6 +16,15 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_time_deltas: dict   # {domain: tensor [B, L]} log1p(dt/3600)
+    seq_time_gaps: dict     # {domain: tensor [B, L]} log1p(gap_minutes)
+    seq_time_hours: dict    # {domain: tensor [B, L]} 0=padding, 1..24
+    seq_time_weekdays: dict # {domain: tensor [B, L]} 0=padding, 1..7
+    seq_time_span_buckets: dict  # {domain: tensor [B, L]} inter-event gap buckets
+
+
+USER_DENSE_PAIR_START = 256
+USER_DENSE_PAIR_END = 568
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -97,6 +106,73 @@ def apply_rope_to_tensor(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class HashEmbedding(nn.Module):
+    """Multi-hash embedding for ultra-high cardinality features.
+
+    Uses multiple hash functions to reduce collision impact. IDs are hashed
+    into fixed-size buckets via different primes, looked up independently,
+    then averaged.  id=0 is treated as padding and always returns zeros.
+    """
+
+    HASH_PRIMES = [999983, 999979, 999961]
+
+    def __init__(
+        self,
+        num_buckets: int = 100000,
+        emb_dim: int = 64,
+        num_hashes: int = 2,
+    ) -> None:
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.num_hashes = num_hashes
+        self.embs = nn.ModuleList([
+            nn.Embedding(num_buckets, emb_dim, padding_idx=0)
+            for _ in range(num_hashes)
+        ])
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        pad_mask = (ids == 0)
+        result = self.embs[0](ids.abs() % (self.num_buckets - 1) + 1)
+        for i in range(1, self.num_hashes):
+            h = (ids.abs() * self.HASH_PRIMES[i - 1]) % (self.num_buckets - 1) + 1
+            result = result + self.embs[i](h)
+        result = result / self.num_hashes
+        result[pad_mask] = 0.0
+        return result
+
+
+class DINTargetAttention(nn.Module):
+    """DIN-style target-aware attention.
+
+    Computes attention scores via MLP(concat(q, k, q-k, q*k)) and returns
+    a weighted sum of key vectors.
+    """
+
+    def __init__(self, d_model: int, hidden_dim: Optional[int] = None) -> None:
+        super().__init__()
+        hidden_dim = hidden_dim or d_model
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(4 * d_model, hidden_dim),
+            nn.PReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, L, D = keys.shape
+        q = query.unsqueeze(1).expand(-1, L, -1)
+        attn_input = torch.cat([q, keys, q - keys, q * keys], dim=-1)
+        scores = self.attn_mlp(attn_input).squeeze(-1)
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(key_padding_mask, -1e9)
+        weights = F.softmax(scores, dim=-1)
+        return (keys * weights.unsqueeze(-1)).sum(dim=1)
+
+
 class SwiGLU(nn.Module):
     """SwiGLU activation: x1 * SiLU(x2)."""
 
@@ -159,6 +235,7 @@ class RoPEMultiheadAttention(nn.Module):
         q_rope_cos: Optional[torch.Tensor] = None,
         q_rope_sin: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        temporal_bias: Optional[torch.Tensor] = None,
     ) -> tuple:
         """Computes multi-head attention with optional RoPE.
 
@@ -175,6 +252,8 @@ class RoPEMultiheadAttention(nn.Module):
                 RoPE for cross-attention with gathered positions.
             q_rope_sin: Same shape as q_rope_cos.
             need_weights: Compatibility parameter, not used.
+            temporal_bias: (B, num_heads, 1, Lk) or (B, num_heads, Lq, Lk),
+                additive bias from TemporalBias.
 
         Returns:
             Tuple of (output, None).
@@ -204,22 +283,42 @@ class RoPEMultiheadAttention(nn.Module):
                 Q = apply_rope_to_tensor(Q, q_cos, q_sin)
 
         # 4. Convert key_padding_mask to SDPA format
+        # When temporal_bias is present, use float mask to allow additive bias.
+        use_float_mask = temporal_bias is not None
         sdpa_attn_mask = None
+
         if key_padding_mask is not None:
-            # key_padding_mask: (B, Lk), True = padding
-            # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
-            sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
-            sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+            if use_float_mask:
+                # Float mask: 0 = attend, -inf = mask out
+                float_mask = torch.zeros(B, 1, 1, Lk, device=query.device, dtype=query.dtype)
+                float_mask.masked_fill_(key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+                sdpa_attn_mask = float_mask.expand(B, self.num_heads, Lq, Lk)
+            else:
+                sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)
+                sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
 
         if attn_mask is not None:
-            # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
-            # Convert to bool: positions that are not -inf are True
-            bool_attn = (attn_mask == 0)  # (Lq, Lk)
+            bool_attn = (attn_mask == 0)
             bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
-            if sdpa_attn_mask is not None:
-                sdpa_attn_mask = sdpa_attn_mask & bool_attn
+            if use_float_mask:
+                float_attn = torch.zeros(B, self.num_heads, Lq, Lk, device=query.device, dtype=query.dtype)
+                float_attn.masked_fill_(~bool_attn, float('-inf'))
+                if sdpa_attn_mask is not None:
+                    sdpa_attn_mask = sdpa_attn_mask + float_attn
+                else:
+                    sdpa_attn_mask = float_attn
             else:
-                sdpa_attn_mask = bool_attn
+                if sdpa_attn_mask is not None:
+                    sdpa_attn_mask = sdpa_attn_mask & bool_attn
+                else:
+                    sdpa_attn_mask = bool_attn
+
+        # Add temporal bias (additive, per-head decay)
+        if temporal_bias is not None:
+            if sdpa_attn_mask is not None:
+                sdpa_attn_mask = sdpa_attn_mask + temporal_bias.expand(B, self.num_heads, Lq, Lk)
+            else:
+                sdpa_attn_mask = temporal_bias.expand(B, self.num_heads, Lq, Lk)
 
         # 5. Scaled Dot-Product Attention
         dropout_p = self.dropout if self.training else 0.0
@@ -276,6 +375,7 @@ class CrossAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
+        temporal_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes cross-attention between query tokens and sequence tokens.
 
@@ -285,6 +385,7 @@ class CrossAttention(nn.Module):
             key_padding_mask: (B, L), True indicates padding positions.
             rope_cos: (1, L, head_dim), KV-side RoPE cosine values.
             rope_sin: (1, L, head_dim), KV-side RoPE sine values.
+            temporal_bias: (B, num_heads, 1, Lk), additive time-decay bias.
 
         Returns:
             Output tensor of shape (B, Nq, D).
@@ -302,6 +403,7 @@ class CrossAttention(nn.Module):
             key_padding_mask=key_padding_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            temporal_bias=temporal_bias,
         )
 
         out = residual + out
@@ -417,7 +519,7 @@ class MultiSeqQueryGenerator(nn.Module):
 
     Generates Q tokens independently for each sequence:
     For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+        GlobalInfo_i = Concat(TargetEmb, F1..FM, MeanPool(Seq_i))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
     """
 
@@ -427,14 +529,14 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
 
-        global_info_dim = (num_ns + 1) * d_model
+        global_info_dim = (num_ns + 2) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
@@ -455,13 +557,15 @@ class MultiSeqQueryGenerator(nn.Module):
 
     def forward(
         self,
+        target_emb: torch.Tensor,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
     ) -> list:
         """Generates query tokens for each sequence.
 
         Args:
+            target_emb: (B, D), pooled candidate item representation.
             ns_tokens: (B, M, D), shared NS tokens.
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
@@ -482,8 +586,8 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
             seq_pooled = seq_sum / seq_count  # (B, D)
 
-            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+            # GlobalInfo_i = Concat(target_emb, NS_flat, seq_pooled_i)
+            global_info = torch.cat([target_emb, ns_flat, seq_pooled], dim=-1)
             global_info = self.global_info_norm(global_info)
 
             # Generate N query tokens
@@ -521,24 +625,25 @@ class SwiGLUEncoder(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Applies the SwiGLU encoder with residual connection.
 
         Args:
             x: (B, L, D)
             key_padding_mask: (B, L), True indicates padding. Not used by
                 this encoder variant.
-            **kwargs: Absorbs rope_cos/rope_sin and other unused parameters.
+            **kwargs: Absorbs rope/time-delta and other unused parameters.
 
         Returns:
-            Tuple of (output tensor of shape (B, L, D), key_padding_mask).
+            Tuple of (output tensor of shape (B, L, D), key_padding_mask,
+            time_delta).
         """
         residual = x
         x = self.norm(x)
         x = self.swiglu(x)
         x = self.dropout(x)
         x = residual + x
-        return x, key_padding_mask
+        return x, key_padding_mask, kwargs.get('time_delta')
 
 
 class TransformerEncoder(nn.Module):
@@ -580,7 +685,9 @@ class TransformerEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        time_delta: Optional[torch.Tensor] = None,
+        temporal_bias_module: Optional[nn.Module] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Applies one Transformer encoder layer.
 
         Args:
@@ -588,13 +695,21 @@ class TransformerEncoder(nn.Module):
             key_padding_mask: (B, L), True indicates padding positions.
             rope_cos: (1, L, head_dim), RoPE cosine values.
             rope_sin: (1, L, head_dim), RoPE sine values.
+            time_delta: (B, L), log1p(dt_hours) recency per sequence token.
+            temporal_bias_module: Module that maps pairwise time distances to
+                an additive attention bias.
 
         Returns:
-            Tuple of (output tensor of shape (B, L, D), key_padding_mask).
+            Tuple of (output tensor of shape (B, L, D), key_padding_mask,
+            time_delta).
         """
         # Self-Attention (Pre-LN) with RoPE
         residual = x
         x = self.norm1(x)
+        temporal_bias = None
+        if temporal_bias_module is not None and time_delta is not None:
+            pairwise_delta = pairwise_log_time_delta(time_delta, time_delta)
+            temporal_bias = temporal_bias_module(pairwise_delta)
         x, _ = self.self_attn(
             query=x,
             key=x,
@@ -602,6 +717,7 @@ class TransformerEncoder(nn.Module):
             key_padding_mask=key_padding_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            temporal_bias=temporal_bias,
         )
         x = residual + x
 
@@ -611,7 +727,7 @@ class TransformerEncoder(nn.Module):
         x = self.ffn(x)
         x = residual + x
 
-        return x, key_padding_mask
+        return x, key_padding_mask, time_delta
 
 class LongerEncoder(nn.Module):
     """Top-K compressed sequence encoder.
@@ -626,7 +742,8 @@ class LongerEncoder(nn.Module):
     the first cross-attention layer does not use a causal mask since Q and K
     have different lengths.
 
-    Returns (output, new_key_padding_mask) so downstream can update the mask.
+    Returns (output, new_key_padding_mask, new_time_delta) so downstream can
+    update the mask and aligned recency values.
     """
 
     def __init__(
@@ -668,8 +785,9 @@ class LongerEncoder(nn.Module):
     def _gather_top_k(
         self,
         x: torch.Tensor,
-        key_padding_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key_padding_mask: torch.Tensor,
+        time_delta: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Selects the latest top_k valid tokens from each sample.
 
         Args:
@@ -681,6 +799,8 @@ class LongerEncoder(nn.Module):
             new_padding_mask: (B, top_k), True indicates padding.
             position_indices: (B, top_k), original position index for each
                 selected token, used for Q-side RoPE.
+            top_k_time_delta: (B, top_k), gathered recency values when
+                time_delta is provided.
         """
         B, L, D = x.shape
         device = x.device
@@ -716,7 +836,12 @@ class LongerEncoder(nn.Module):
         # position_indices for Q-side RoPE
         position_indices = indices  # (B, top_k)
 
-        return top_k_tokens, new_padding_mask, position_indices
+        top_k_time_delta = None
+        if time_delta is not None:
+            top_k_time_delta = torch.gather(time_delta, dim=1, index=indices)
+            top_k_time_delta = top_k_time_delta * (~new_padding_mask).to(time_delta.dtype)
+
+        return top_k_tokens, new_padding_mask, position_indices, top_k_time_delta
 
     def forward(
         self,
@@ -724,7 +849,9 @@ class LongerEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        time_delta: Optional[torch.Tensor] = None,
+        temporal_bias_module: Optional[nn.Module] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Applies the LongerEncoder with adaptive cross/self attention.
 
         Args:
@@ -733,17 +860,23 @@ class LongerEncoder(nn.Module):
             rope_cos: (1, L, head_dim), RoPE cosine values (length must cover
                 original sequence length L).
             rope_sin: (1, L, head_dim), RoPE sine values.
+            time_delta: (B, L), log1p(dt_hours) recency per sequence token.
+            temporal_bias_module: Module that maps pairwise time distances to
+                an additive attention bias.
 
         Returns:
             output: (B, top_k, D), compressed sequence.
             new_key_padding_mask: (B, top_k), updated padding mask.
+            new_time_delta: (B, top_k) when the sequence is compressed,
+                otherwise the input time_delta.
         """
         B, L, D = x.shape
 
         if L > self.top_k:
             # === Cross Attention mode (first MultiSeqHyFormerBlock) ===
             # 1. Extract latest top_k tokens as query
-            q, new_mask, q_pos_indices = self._gather_top_k(x, key_padding_mask)
+            q, new_mask, q_pos_indices, new_time_delta = self._gather_top_k(
+                x, key_padding_mask, time_delta)
 
             # 2. Pre-LN
             q_normed = self.norm_q(q)
@@ -762,6 +895,11 @@ class LongerEncoder(nn.Module):
                 q_rope_cos = torch.gather(cos_expanded, 1, idx)  # (B, top_k, head_dim)
                 q_rope_sin = torch.gather(sin_expanded, 1, idx)
 
+            temporal_bias = None
+            if temporal_bias_module is not None and time_delta is not None and new_time_delta is not None:
+                pairwise_delta = pairwise_log_time_delta(new_time_delta, time_delta)
+                temporal_bias = temporal_bias_module(pairwise_delta)
+
             # 4. Cross Attention (no causal mask since Q and K have different lengths)
             attn_out, _ = self.attn(
                 query=q_normed,
@@ -772,11 +910,13 @@ class LongerEncoder(nn.Module):
                 rope_sin=rope_sin,
                 q_rope_cos=q_rope_cos,
                 q_rope_sin=q_rope_sin,
+                temporal_bias=temporal_bias,
             )
             out = q + attn_out  # Residual based on q
         else:
             # === Self Attention mode (subsequent MultiSeqHyFormerBlocks) ===
             new_mask = key_padding_mask
+            new_time_delta = time_delta
 
             # Pre-LN (Q and KV share norm_q)
             x_normed = self.norm_q(x)
@@ -788,6 +928,11 @@ class LongerEncoder(nn.Module):
                     L, device=x.device
                 )
 
+            temporal_bias = None
+            if temporal_bias_module is not None and time_delta is not None:
+                pairwise_delta = pairwise_log_time_delta(time_delta, time_delta)
+                temporal_bias = temporal_bias_module(pairwise_delta)
+
             attn_out, _ = self.attn(
                 query=x_normed,
                 key=x_normed,
@@ -796,6 +941,7 @@ class LongerEncoder(nn.Module):
                 attn_mask=attn_mask,
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
+                temporal_bias=temporal_bias,
             )
             out = x + attn_out
 
@@ -805,7 +951,7 @@ class LongerEncoder(nn.Module):
         out = self.ffn(out)
         out = residual + out
 
-        return out, new_mask
+        return out, new_mask, new_time_delta
 
 
 def create_sequence_encoder(
@@ -867,7 +1013,8 @@ class MultiSeqHyFormerBlock(nn.Module):
         dropout: float = 0.0,
         top_k: int = 50,
         causal: bool = False,
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'full',
+        use_ns_self_attn: bool = False,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -909,6 +1056,8 @@ class MultiSeqHyFormerBlock(nn.Module):
             mode=rank_mixer_mode
         )
 
+        self.ns_self_attn = NSSelfAttention(d_model, num_heads, dropout) if use_ns_self_attn else None
+
     def forward(
         self,
         q_tokens_list: list,
@@ -917,7 +1066,10 @@ class MultiSeqHyFormerBlock(nn.Module):
         seq_padding_masks: list,
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
-    ) -> Tuple[list, torch.Tensor, list, list]:
+        seq_time_deltas: Optional[List[torch.Tensor]] = None,
+        query_temporal_bias: Optional[nn.Module] = None,
+        seq_temporal_bias: Optional[nn.Module] = None,
+    ) -> Tuple[list, torch.Tensor, list, list, Optional[List[torch.Tensor]]]:
         """Processes one multi-sequence HyFormer block step.
 
         Args:
@@ -927,13 +1079,17 @@ class MultiSeqHyFormerBlock(nn.Module):
             seq_padding_masks: List of (B, L_i) masks, length S.
             rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
             rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+            seq_time_deltas: List of (B, L_i) log1p(dt_hours) tensors.
+            query_temporal_bias: Module for query-to-sequence temporal decay.
+            seq_temporal_bias: Module for sequence-evolution token-token decay.
 
         Returns:
             A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
             next_q_list is a list of (B, Nq, D) updated query tensors,
             next_ns is (B, Nns, D) updated non-sequence tokens,
             next_seq_list is a list of (B, L_i', D) encoded sequence tensors,
-            and next_masks is a list of (B, L_i') updated padding masks.
+            next_masks is a list of (B, L_i') updated padding masks, and
+            next_time_deltas mirrors updated sequence lengths when provided.
         """
         S = self.num_sequences
         Nq = self.num_queries
@@ -941,27 +1097,44 @@ class MultiSeqHyFormerBlock(nn.Module):
         # 1. Independent Sequence Evolution per sequence
         next_seqs = []
         next_masks = []
+        next_time_deltas = [] if seq_time_deltas is not None else None
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            td = seq_time_deltas[i] if seq_time_deltas is not None else None
             result = self.seq_encoders[i](
                 seq_tokens_list[i], seq_padding_masks[i],
                 rope_cos=rc, rope_sin=rs,
+                time_delta=td,
+                temporal_bias_module=seq_temporal_bias,
             )
-            next_seq_i, mask_i = result
+            if len(result) == 3:
+                next_seq_i, mask_i, next_td_i = result
+            else:
+                next_seq_i, mask_i = result
+                next_td_i = td
             next_seqs.append(next_seq_i)
             next_masks.append(mask_i)
+            if next_time_deltas is not None:
+                next_time_deltas.append(next_td_i)
 
         # 2. Independent Query Decoding per sequence
         decoded_qs = []
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            tb = None
+            if query_temporal_bias is not None and next_time_deltas is not None:
+                tb = query_temporal_bias(next_time_deltas[i])
             decoded_q_i = self.cross_attns[i](
                 q_tokens_list[i], next_seqs[i], next_masks[i],
-                rope_cos=rc, rope_sin=rs,
+                rope_cos=rc, rope_sin=rs, temporal_bias=tb,
             )
             decoded_qs.append(decoded_q_i)
+
+        # 2.5. NS Self-Attention (optional feature crossing)
+        if self.ns_self_attn is not None:
+            ns_tokens = self.ns_self_attn(ns_tokens)
 
         # 3. Token Fusion: concatenate all decoded_q + ns_tokens
         combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, Nq*S + Nns, D)
@@ -977,7 +1150,192 @@ class MultiSeqHyFormerBlock(nn.Module):
             offset += Nq
         next_ns = boosted[:, offset:, :]
 
-        return next_q_list, next_ns, next_seqs, next_masks
+        return next_q_list, next_ns, next_seqs, next_masks, next_time_deltas
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NS Self-Attention (Feature Crossing)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class NSSelfAttention(nn.Module):
+    """Self-attention among NS tokens for feature crossing.
+
+    NS tokens have no positional ordering, so standard multi-head attention
+    (without RoPE) is used.  Pre-LN residual style, consistent with
+    CrossAttention(ln_mode='pre').
+    """
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=num_heads,
+            dropout=dropout, batch_first=True,
+        )
+
+    def forward(self, ns_tokens: torch.Tensor) -> torch.Tensor:
+        """Args:
+            ns_tokens: (B, Nns, D)
+        Returns:
+            (B, Nns, D) with residual connection.
+        """
+        residual = ns_tokens
+        x = self.norm(ns_tokens)
+        x, _ = self.attn(x, x, x, need_weights=False)
+        return residual + x
+
+
+class TemporalBias(nn.Module):
+    """Per-head learnable time-decay bias for attention scores.
+
+    Given log1p-compressed time deltas, produces an additive bias. A 2D input
+    (B, Lk) is treated as query-to-history recency and returns
+    (B, num_heads, 1, Lk). A 3D input (B, Lq, Lk) is treated as pairwise
+    token-token distance and returns (B, num_heads, Lq, Lk).
+    Each head learns its own decay rate, enabling multi-scale temporal focus.
+    """
+
+    def __init__(self, num_heads: int) -> None:
+        super().__init__()
+        self.alpha = nn.Parameter(torch.full((num_heads,), 0.1))
+
+    def forward(self, time_delta: torch.Tensor) -> torch.Tensor:
+        """Args:
+            time_delta: (B, Lk) or (B, Lq, Lk) log1p(dt_hours).
+        Returns:
+            Additive attention bias with a per-head temporal decay.
+        """
+        if time_delta.dim() == 2:
+            bias = -self.alpha.abs().view(1, -1, 1) * time_delta.unsqueeze(1)
+            return bias.unsqueeze(2)
+        if time_delta.dim() == 3:
+            return -self.alpha.abs().view(1, -1, 1, 1) * time_delta.unsqueeze(1)
+        raise ValueError(
+            f"TemporalBias expects a 2D or 3D tensor, got shape {tuple(time_delta.shape)}"
+        )
+
+
+def pairwise_log_time_delta(
+    q_time_delta: torch.Tensor,
+    k_time_delta: torch.Tensor,
+) -> torch.Tensor:
+    """Builds log1p-compressed token-token time distances from recency values.
+
+    q_time_delta and k_time_delta are log1p(current_ts - event_ts in hours).
+    The pairwise event distance is recoverable because both are measured from
+    the same current timestamp.
+    """
+    q_hours = torch.expm1(q_time_delta.clamp_min(0.0)).clamp_min(0.0)
+    k_hours = torch.expm1(k_time_delta.clamp_min(0.0)).clamp_min(0.0)
+    return torch.log1p((q_hours.unsqueeze(-1) - k_hours.unsqueeze(-2)).abs())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SE-Net Feature Gating (FiBiNet-style)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SENetGating(nn.Module):
+    """Squeeze-and-Excitation gating for NS tokens.
+
+    Learns per-token importance weights via a two-layer bottleneck MLP
+    applied to the mean-pooled (squeezed) representation of each token.
+    """
+
+    def __init__(self, num_tokens: int, d_model: int, reduction: int = 2) -> None:
+        super().__init__()
+        mid = max(num_tokens // reduction, 4)
+        self.gate = nn.Sequential(
+            nn.Linear(num_tokens, mid),
+            nn.ReLU(),
+            nn.Linear(mid, num_tokens),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies SE gating.
+
+        Args:
+            x: (B, T, D) NS tokens.
+
+        Returns:
+            Gated tokens of shape (B, T, D).
+        """
+        w = x.mean(dim=-1)        # (B, T) — squeeze
+        w = self.gate(w)           # (B, T) — excitation
+        return x * w.unsqueeze(-1) # (B, T, D) — scale
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DCN-v2 Cross Network
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class CrossNet(nn.Module):
+    """DCN-v2 cross network with per-layer dropout and a learnable output gate.
+
+    Each cross layer: x_{l+1} = x_0 ⊙ (W_l · x_l + b_l) + x_l
+    After all layers: output = sigmoid(gate) * cross_out + (1 - sigmoid(gate)) * x_0
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        num_layers: int,
+        low_rank: int = 0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_layers = num_layers
+        self.low_rank = low_rank
+
+        if low_rank > 0:
+            self.U = nn.ParameterList([
+                nn.Parameter(torch.empty(in_features, low_rank))
+                for _ in range(num_layers)
+            ])
+            self.V = nn.ParameterList([
+                nn.Parameter(torch.empty(low_rank, in_features))
+                for _ in range(num_layers)
+            ])
+            for u, v in zip(self.U, self.V):
+                nn.init.xavier_normal_(u)
+                nn.init.xavier_normal_(v)
+        else:
+            self.W = nn.ParameterList([
+                nn.Parameter(torch.empty(in_features, in_features))
+                for _ in range(num_layers)
+            ])
+            for w in self.W:
+                nn.init.xavier_normal_(w)
+
+        self.bias = nn.ParameterList([
+            nn.Parameter(torch.zeros(in_features))
+            for _ in range(num_layers)
+        ])
+
+        self.drop = nn.Dropout(dropout) if dropout > 0 else None
+
+        # Learnable gate initialized to -2 so sigmoid(-2)≈0.12,
+        # meaning the model starts close to baseline and gradually
+        # learns how much cross information to blend in.
+        self.gate = nn.Parameter(torch.full((in_features,), -2.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0 = x
+        xl = x
+        for i in range(self.num_layers):
+            if self.low_rank > 0:
+                vx = xl @ self.V[i].t()
+                uvx = vx @ self.U[i].t()
+            else:
+                uvx = xl @ self.W[i].t()
+            xl = x0 * (uvx + self.bias[i]) + xl
+            if self.drop is not None:
+                xl = self.drop(xl)
+        g = torch.sigmoid(self.gate)
+        return g * xl + (1 - g) * x0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -995,7 +1353,8 @@ class GroupNSTokenizer(nn.Module):
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+                 emb_skip_threshold: int = 0,
+                 hash_bucket_size: int = 0) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
@@ -1022,6 +1381,13 @@ class GroupNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
+        # Hash embeddings for high-cardinality features that were skipped
+        self._hash_embs = nn.ModuleDict()
+        if hash_bucket_size > 0:
+            for i, (vs, offset, length) in enumerate(feature_specs):
+                if self._emb_index[i] == -1 and int(vs) > 0:
+                    self._hash_embs[str(i)] = HashEmbedding(hash_bucket_size, emb_dim)
+
         # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
         self.group_projs = nn.ModuleList([
             nn.Sequential(
@@ -1047,24 +1413,33 @@ class GroupNSTokenizer(nn.Module):
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
                 if emb_real_idx == -1:
-                    # Filtered high-cardinality feature: output zero vector
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                    hash_key = str(fid_idx)
+                    if hash_key in self._hash_embs:
+                        emb_layer = self._hash_embs[hash_key]
+                        if length == 1:
+                            fid_emb = emb_layer(int_feats[:, offset].long())
+                        else:
+                            vals = int_feats[:, offset:offset + length].long()
+                            emb_all = emb_layer(vals)
+                            mask = (vals != 0).float().unsqueeze(-1)
+                            count = mask.sum(dim=1).clamp(min=1)
+                            fid_emb = (emb_all * mask).sum(dim=1) / count
+                    else:
+                        fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
-                        # Single-value feature: direct lookup
-                        fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
+                        fid_emb = emb_layer(int_feats[:, offset].long())
                     else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
-                        vals = int_feats[:, offset:offset + length].long()  # (B, length)
-                        emb_all = emb_layer(vals)  # (B, length, emb_dim)
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                        vals = int_feats[:, offset:offset + length].long()
+                        emb_all = emb_layer(vals)
+                        mask = (vals != 0).float().unsqueeze(-1)
+                        count = mask.sum(dim=1).clamp(min=1)
+                        fid_emb = (emb_all * mask).sum(dim=1) / count
                 fid_embs.append(fid_emb)
-            cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
-            tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
-        return torch.cat(tokens, dim=1)  # (B, num_groups, D)
+            cat_emb = torch.cat(fid_embs, dim=-1)
+            tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))
+        return torch.cat(tokens, dim=1)
 
 
 class RankMixerNSTokenizer(nn.Module):
@@ -1083,6 +1458,7 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        hash_bucket_size: int = 0,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1093,6 +1469,7 @@ class RankMixerNSTokenizer(nn.Module):
             d_model: Output token dimension.
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            hash_bucket_size: Bucket count for hash embeddings on skipped features.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1120,6 +1497,13 @@ class RankMixerNSTokenizer(nn.Module):
                 real_idx += 1
             else:
                 self._emb_index.append(-1)
+
+        # Hash embeddings for high-cardinality features that were skipped
+        self._hash_embs = nn.ModuleDict()
+        if hash_bucket_size > 0:
+            for i, (vs, offset, length) in enumerate(feature_specs):
+                if self._emb_index[i] == -1 and int(vs) > 0:
+                    self._hash_embs[str(i)] = HashEmbedding(hash_bucket_size, emb_dim)
 
         # Compute total embedding dim: sum of all fids across all groups
         total_num_fids = sum(len(g) for g in groups)
@@ -1161,7 +1545,19 @@ class RankMixerNSTokenizer(nn.Module):
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
                 if emb_real_idx == -1:
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                    hash_key = str(fid_idx)
+                    if hash_key in self._hash_embs:
+                        emb_layer = self._hash_embs[hash_key]
+                        if length == 1:
+                            fid_emb = emb_layer(int_feats[:, offset].long())
+                        else:
+                            vals = int_feats[:, offset:offset + length].long()
+                            emb_all = emb_layer(vals)
+                            mask = (vals != 0).float().unsqueeze(-1)
+                            count = mask.sum(dim=1).clamp(min=1)
+                            fid_emb = (emb_all * mask).sum(dim=1) / count
+                    else:
+                        fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
@@ -1187,6 +1583,54 @@ class RankMixerNSTokenizer(nn.Module):
             tokens.append(F.silu(proj(chunk)).unsqueeze(1))  # (B, 1, d_model)
 
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
+
+
+class UserSparseDensePairResidual(nn.Module):
+    """Builds a residual vector from paired user sparse ids and dense values."""
+
+    def __init__(
+        self,
+        pair_specs: List[Tuple[int, int, int, int, int]],
+        emb_dim: int,
+        d_model: int,
+    ) -> None:
+        """Initializes paired sparse/dense residual features.
+
+        Args:
+            pair_specs: [(fid, vocab_size, int_offset, dense_offset, length), ...].
+            emb_dim: Embedding dimension per fid.
+            d_model: Output residual dimension.
+        """
+        super().__init__()
+        self.pair_specs = pair_specs
+        self.emb_dim = emb_dim
+        self.embs = nn.ModuleList([
+            nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0)
+            for _, vs, _, _, _ in pair_specs
+        ])
+        self.proj = nn.Sequential(
+            nn.Linear(len(pair_specs) * emb_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        pooled = []
+        for emb, (_, _, int_offset, dense_offset, length) in zip(self.embs, self.pair_specs):
+            ids = user_int_feats[:, int_offset:int_offset + length].long()
+            values = user_dense_feats[:, dense_offset:dense_offset + length]
+            weights = torch.log1p(values.abs()) * values.sign()
+            mask = (ids != 0).to(values.dtype)
+
+            emb_all = emb(ids)
+            weighted = emb_all * weights.unsqueeze(-1) * mask.unsqueeze(-1)
+            count = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pooled.append(weighted.sum(dim=1) / count)
+
+        return F.silu(self.proj(torch.cat(pooled, dim=-1)))
 
 
 class PCVRHyFormer(nn.Module):
@@ -1220,6 +1664,8 @@ class PCVRHyFormer(nn.Module):
         seq_causal: bool = False,
         action_num: int = 1,
         num_time_buckets: int = 65,
+        num_time_span_buckets: int = 0,
+        use_calendar_time: bool = True,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1229,6 +1675,25 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # DCN-v2 cross network
+        num_cross_layers: int = 0,
+        cross_low_rank: int = 0,
+        cross_dropout: float = 0.1,
+        # SE-Net feature gating
+        use_se_net: bool = False,
+        # Hash embedding for ultra-high cardinality features
+        hash_bucket_size: int = 0,
+        # Target-aware attention
+        use_target_attention: bool = False,
+        # NS self-attention (feature crossing inside blocks)
+        use_ns_self_attn: bool = False,
+        # NS output fusion (fuse refined NS tokens into output)
+        use_ns_output_fusion: bool = False,
+        # Temporal Attention Bias (per-head time decay in cross-attention)
+        use_temporal_bias: bool = False,
+        # Inter-event time gap embedding
+        use_time_gap: bool = False,
+        user_sparse_dense_pair_specs: Optional[List[Tuple[int, int, int, int, int]]] = None,
     ) -> None:
         super().__init__()
 
@@ -1239,11 +1704,22 @@ class PCVRHyFormer(nn.Module):
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
+        self.num_time_span_buckets = num_time_span_buckets
+        self.use_calendar_time = use_calendar_time
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.hash_bucket_size = hash_bucket_size
+        self.use_target_attention = use_target_attention
+        self.use_temporal_bias = use_temporal_bias
+        self.use_time_gap = use_time_gap
+        self.user_dense_proj_dim = user_dense_dim
+        if user_dense_dim >= USER_DENSE_PAIR_END:
+            self.user_dense_proj_dim = (
+                user_dense_dim - (USER_DENSE_PAIR_END - USER_DENSE_PAIR_START)
+            )
 
         # ================== NS Tokens Construction ==================
 
@@ -1255,6 +1731,7 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                hash_bucket_size=hash_bucket_size,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1264,6 +1741,7 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                hash_bucket_size=hash_bucket_size,
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
@@ -1280,6 +1758,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                hash_bucket_size=hash_bucket_size,
             )
             num_user_ns = user_ns_tokens
 
@@ -1290,6 +1769,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                hash_bucket_size=hash_bucket_size,
             )
             num_item_ns = item_ns_tokens
         else:
@@ -1297,11 +1777,18 @@ class PCVRHyFormer(nn.Module):
 
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
+        self.user_sparse_dense_pair_residual = None
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
+                nn.Linear(self.user_dense_proj_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            if user_sparse_dense_pair_specs:
+                self.user_sparse_dense_pair_residual = UserSparseDensePairResidual(
+                    pair_specs=user_sparse_dense_pair_specs,
+                    emb_dim=emb_dim,
+                    d_model=d_model,
+                )
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1314,6 +1801,26 @@ class PCVRHyFormer(nn.Module):
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
+
+        # ================== SE-Net Feature Gating (optional) ==================
+        self.use_se_net = use_se_net
+        if use_se_net:
+            self.se_gate = SENetGating(self.num_ns, d_model)
+            logging.info(f"SENetGating enabled: num_tokens={self.num_ns}, d_model={d_model}")
+
+        # ================== DCN-v2 Cross Network (optional) ==================
+        self.num_cross_layers = num_cross_layers
+        if num_cross_layers > 0:
+            cross_dim = self.num_ns * d_model
+            self.cross_net = CrossNet(
+                in_features=cross_dim,
+                num_layers=num_cross_layers,
+                low_rank=cross_low_rank,
+                dropout=cross_dropout,
+            )
+            self.cross_ln = nn.LayerNorm(d_model)
+            logging.info(f"CrossNet: {num_cross_layers} layers, dim={cross_dim}, "
+                         f"low_rank={cross_low_rank}, dropout={cross_dropout}")
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1373,9 +1880,57 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ================== Hash Embeddings for Sequences ==================
+        self._seq_hash_embs = nn.ModuleDict()
+        if hash_bucket_size > 0:
+            for domain in self.seq_domains:
+                hash_embs = nn.ModuleDict()
+                vs_list = seq_vocab_sizes[domain]
+                idx_map = self._seq_emb_index[domain]
+                for i, vs in enumerate(vs_list):
+                    if idx_map[i] == -1 and int(vs) > 0:
+                        hash_embs[str(i)] = HashEmbedding(hash_bucket_size, emb_dim)
+                if len(hash_embs) > 0:
+                    self._seq_hash_embs[domain] = hash_embs
+            n_hash = sum(len(v) for v in self._seq_hash_embs.values())
+            if n_hash > 0:
+                logging.info(f"HashEmbedding: {n_hash} features across "
+                             f"{len(self._seq_hash_embs)} seq domains, "
+                             f"bucket_size={hash_bucket_size}")
+
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+
+        # ================== Calendar / Inter-event Time Feature Embeddings ==================
+        if use_calendar_time:
+            self.hour_embedding = nn.Embedding(25, d_model, padding_idx=0)
+            self.weekday_embedding = nn.Embedding(8, d_model, padding_idx=0)
+            self.cyclical_time_proj = nn.Linear(4, d_model, bias=False)
+
+        if use_calendar_time or num_time_span_buckets > 0:
+            self.time_feature_norm = nn.LayerNorm(d_model)
+
+        if num_time_span_buckets > 0:
+            self.time_span_embedding = nn.Embedding(
+                num_time_span_buckets, d_model, padding_idx=0)
+
+        # ================== Temporal Attention Bias (optional) ==================
+        if use_temporal_bias:
+            self.temporal_bias = TemporalBias(num_heads)
+            self.seq_temporal_bias = TemporalBias(num_heads)
+        else:
+            self.temporal_bias = None
+            self.seq_temporal_bias = None
+
+        # ================== Inter-event Time Gap Embedding (optional) ==================
+        if use_time_gap:
+            self.gap_proj = nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.SiLU(),
+            )
+        else:
+            self.gap_proj = None
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1386,6 +1941,31 @@ class PCVRHyFormer(nn.Module):
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
         )
+
+        # ================== Target-Aware Attention (optional) ==================
+        if use_target_attention:
+            self.item_repr_mlp = nn.Sequential(
+                nn.Linear(2 * d_model, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.target_attns = nn.ModuleList([
+                DINTargetAttention(d_model) for _ in self.seq_domains
+            ])
+            target_match_dim = self.num_sequences * (6 * d_model + 3)
+            self.target_match_mlp = nn.Sequential(
+                nn.Linear(target_match_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model, d_model),
+            )
+            self.target_match_gate_logit = nn.Parameter(torch.full((1,), -3.0))
+            logging.info(f"TargetSeqMatchResidual: DIN + mean/last/dot, "
+                         f"{self.num_sequences} domains, dim={target_match_dim}")
 
         # MultiSeqHyFormerBlock stack
         self.blocks = nn.ModuleList([
@@ -1401,6 +1981,7 @@ class PCVRHyFormer(nn.Module):
                 top_k=seq_top_k,
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
+                use_ns_self_attn=use_ns_self_attn,
             )
             for _ in range(num_hyformer_blocks)
         ])
@@ -1417,6 +1998,16 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
+
+        # NS output fusion (optional)
+        self.use_ns_output_fusion = use_ns_output_fusion
+        if use_ns_output_fusion:
+            self.ns_output_fusion = nn.Sequential(
+                nn.Linear(2 * d_model, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+            )
+            logging.info("NS output fusion enabled: pooled NS tokens fused into output")
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -1458,14 +2049,42 @@ class PCVRHyFormer(nn.Module):
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
+        # Init hash embeddings for sequences
+        for domain_hash_embs in self._seq_hash_embs.values():
+            for he in domain_hash_embs.values():
+                for emb in he.embs:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+
         for tokenizer in [self.user_ns_tokenizer, self.item_ns_tokenizer]:
             for emb in tokenizer.embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+            # Init hash embeddings for NS tokenizers
+            for he in tokenizer._hash_embs.values():
+                for emb in he.embs:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+
+        if self.user_sparse_dense_pair_residual is not None:
+            for emb in self.user_sparse_dense_pair_residual.embs:
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        if self.use_calendar_time:
+            nn.init.xavier_normal_(self.hour_embedding.weight.data)
+            self.hour_embedding.weight.data[0, :] = 0
+            nn.init.xavier_normal_(self.weekday_embedding.weight.data)
+            self.weekday_embedding.weight.data[0, :] = 0
+            nn.init.xavier_normal_(self.cyclical_time_proj.weight.data)
+
+        if self.num_time_span_buckets > 0:
+            nn.init.xavier_normal_(self.time_span_embedding.weight.data)
+            self.time_span_embedding.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1492,7 +2111,6 @@ class PCVRHyFormer(nn.Module):
             for i, vs in enumerate(vocab_sizes):
                 real_idx = emb_index[i]
                 if real_idx == -1:
-                    # Skipped by emb_skip_threshold, no embedding to reinit
                     continue
                 emb = emb_list[real_idx]
                 if int(vs) > cardinality_threshold:
@@ -1502,6 +2120,15 @@ class PCVRHyFormer(nn.Module):
                     reinit_count += 1
                 else:
                     skip_count += 1
+
+        # Reinit hash embeddings for sequences (always high-cardinality)
+        for domain_hash_embs in self._seq_hash_embs.values():
+            for he in domain_hash_embs.values():
+                for emb in he.embs:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
 
         for tokenizer, specs in [
             (self.user_ns_tokenizer, self.user_ns_tokenizer.feature_specs),
@@ -1520,8 +2147,33 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
+            # Reinit hash embeddings for NS tokenizers
+            for he in tokenizer._hash_embs.values():
+                for emb in he.embs:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+
+        if self.user_sparse_dense_pair_residual is not None:
+            for emb, (_, vs, _, _, _) in zip(
+                self.user_sparse_dense_pair_residual.embs,
+                self.user_sparse_dense_pair_residual.pair_specs,
+            ):
+                if int(vs) > cardinality_threshold:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+                else:
+                    skip_count += 1
+
         # time_embedding is always preserved
         if self.num_time_buckets > 0:
+            skip_count += 1
+        if self.use_calendar_time:
+            skip_count += 2
+        if self.num_time_span_buckets > 0:
             skip_count += 1
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
@@ -1541,6 +2193,34 @@ class PCVRHyFormer(nn.Module):
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
+    def _make_user_dense_proj_input(self, user_dense_feats: torch.Tensor) -> torch.Tensor:
+        """Drops fid62-66 dense values before the ordinary dense-token projection."""
+        if user_dense_feats.shape[1] < USER_DENSE_PAIR_END:
+            return user_dense_feats
+        return torch.cat([
+            user_dense_feats[:, :USER_DENSE_PAIR_START],
+            user_dense_feats[:, USER_DENSE_PAIR_END:],
+        ], dim=1)
+
+    def _make_user_dense_token(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Builds the single user dense token plus paired sparse/dense residual."""
+        dense_proj_input = self._make_user_dense_proj_input(user_dense_feats)
+        user_dense_tok = F.silu(self.user_dense_proj(dense_proj_input))
+        if self.user_sparse_dense_pair_residual is not None:
+            user_dense_tok = user_dense_tok + self.user_sparse_dense_pair_residual(
+                user_int_feats, user_dense_feats)
+        return user_dense_tok.unsqueeze(1)
+
+    def _make_item_repr(self, item_tokens: torch.Tensor) -> torch.Tensor:
+        """Pools item tokens with mean/max and projects to d_model."""
+        item_mean = item_tokens.mean(dim=1)
+        item_max = item_tokens.max(dim=1).values
+        return self.item_repr_mlp(torch.cat([item_mean, item_max], dim=-1))
+
     def _embed_seq_domain(
         self,
         seq: torch.Tensor,
@@ -1549,6 +2229,11 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        hash_embs: Optional[nn.ModuleDict] = None,
+        time_gap: Optional[torch.Tensor] = None,
+        time_hour_ids: Optional[torch.Tensor] = None,
+        time_weekday_ids: Optional[torch.Tensor] = None,
+        time_span_bucket_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1556,8 +2241,14 @@ class PCVRHyFormer(nn.Module):
         for i in range(S):
             real_idx = emb_index[i] if i < len(emb_index) else -1
             if real_idx == -1:
-                # Feature skipped by emb_skip_threshold: output zero vector
-                emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
+                hash_key = str(i)
+                if hash_embs is not None and hash_key in hash_embs:
+                    e = hash_embs[hash_key](seq[:, i, :])
+                    if is_id[i] and self.training:
+                        e = self.seq_id_emb_dropout(e)
+                    emb_list.append(e)
+                else:
+                    emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
             else:
                 emb = sideinfo_embs[real_idx]
                 e = emb(seq[:, i, :])  # (B, L, emb_dim)
@@ -1571,6 +2262,33 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
 
+        # Add absolute calendar-time features from event timestamps.
+        if self.use_calendar_time and time_hour_ids is not None and time_weekday_ids is not None:
+            hour_emb = self.time_feature_norm(self.hour_embedding(time_hour_ids))
+            weekday_emb = self.time_feature_norm(self.weekday_embedding(time_weekday_ids))
+
+            valid = (time_hour_ids != 0).to(dtype=token_emb.dtype).unsqueeze(-1)
+            hour_float = (time_hour_ids.clamp_min(1) - 1).to(dtype=token_emb.dtype)
+            weekday_float = (time_weekday_ids.clamp_min(1) - 1).to(dtype=token_emb.dtype)
+            cyclical_features = torch.stack([
+                torch.sin(2 * math.pi * hour_float / 24.0),
+                torch.cos(2 * math.pi * hour_float / 24.0),
+                torch.sin(2 * math.pi * weekday_float / 7.0),
+                torch.cos(2 * math.pi * weekday_float / 7.0),
+            ], dim=-1)
+            cyclical_emb = self.time_feature_norm(
+                self.cyclical_time_proj(cyclical_features) * valid)
+            token_emb = token_emb + hour_emb + weekday_emb + cyclical_emb
+
+        # Add discrete inter-event gap bucket embedding.
+        if self.num_time_span_buckets > 0 and time_span_bucket_ids is not None:
+            token_emb = token_emb + self.time_feature_norm(
+                self.time_span_embedding(time_span_bucket_ids))
+
+        # Add inter-event gap embedding
+        if self.gap_proj is not None and time_gap is not None:
+            token_emb = token_emb + self.gap_proj(time_gap.unsqueeze(-1))
+
         return token_emb
 
     def _make_padding_mask(
@@ -1581,15 +2299,78 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _seq_mean_last_pool(
+        self,
+        seq_tokens: torch.Tensor,
+        seq_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns valid mean, last valid token, and has-valid mask."""
+        B, _, D = seq_tokens.shape
+        valid = ~seq_mask
+        valid_f = valid.to(dtype=seq_tokens.dtype).unsqueeze(-1)
+        count = valid_f.sum(dim=1).clamp(min=1.0)
+        seq_mean = (seq_tokens * valid_f).sum(dim=1) / count
+
+        valid_len = valid.sum(dim=1)
+        has_valid = valid_len > 0
+        last_idx = (valid_len - 1).clamp(min=0)
+        gather_idx = last_idx.view(B, 1, 1).expand(-1, 1, D)
+        seq_last = seq_tokens.gather(dim=1, index=gather_idx).squeeze(1)
+        seq_last = seq_last * has_valid.to(dtype=seq_tokens.dtype).unsqueeze(-1)
+        return seq_mean, seq_last, has_valid
+
+    def _apply_target_match_residual(
+        self,
+        output: torch.Tensor,
+        item_repr: torch.Tensor,
+        seq_tokens_list: list,
+        seq_masks_list: list,
+    ) -> torch.Tensor:
+        """Adds a gated target-item/history match residual to final output."""
+        match_parts = []
+        for i in range(self.num_sequences):
+            seq_mean, seq_last, has_valid = self._seq_mean_last_pool(
+                seq_tokens_list[i], seq_masks_list[i])
+            seq_attn = self.target_attns[i](
+                item_repr, seq_tokens_list[i], seq_masks_list[i])
+            seq_attn = seq_attn * has_valid.to(dtype=seq_attn.dtype).unsqueeze(-1)
+
+            dot_scale = math.sqrt(self.d_model)
+            dot_mean = (item_repr * seq_mean).sum(dim=-1, keepdim=True) / dot_scale
+            dot_last = (item_repr * seq_last).sum(dim=-1, keepdim=True) / dot_scale
+            dot_attn = (item_repr * seq_attn).sum(dim=-1, keepdim=True) / dot_scale
+            match_parts.append(torch.cat([
+                item_repr,
+                seq_mean,
+                seq_last,
+                seq_attn,
+                item_repr * seq_attn,
+                item_repr - seq_attn,
+                dot_mean,
+                dot_last,
+                dot_attn,
+            ], dim=-1))
+
+        match_feat = torch.cat(match_parts, dim=-1)
+        residual = self.target_match_mlp(match_feat)
+        gate = torch.sigmoid(self.target_match_gate_logit).to(dtype=output.dtype)
+        return output + gate * residual
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
-        apply_dropout: bool = True
-    ) -> torch.Tensor:
-        """Runs the multi-sequence block stack with dropout and output projection."""
+        apply_dropout: bool = True,
+        time_delta_list: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Runs the multi-sequence block stack with dropout and output projection.
+
+        Returns:
+            A tuple (output, ns_out) where output is (B, D) and ns_out is
+            (B, Nns, D) when NS output fusion is enabled, None otherwise.
+        """
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
@@ -1599,6 +2380,7 @@ class PCVRHyFormer(nn.Module):
         curr_ns = ns_tokens
         curr_seqs = seq_tokens_list
         curr_masks = seq_masks_list
+        curr_time_deltas = time_delta_list
 
         for block in self.blocks:
             # Precompute RoPE cos/sin for each sequence
@@ -1614,13 +2396,16 @@ class PCVRHyFormer(nn.Module):
                     rope_cos_list.append(cos)
                     rope_sin_list.append(sin)
 
-            curr_qs, curr_ns, curr_seqs, curr_masks = block(
+            curr_qs, curr_ns, curr_seqs, curr_masks, curr_time_deltas = block(
                 q_tokens_list=curr_qs,
                 ns_tokens=curr_ns,
                 seq_tokens_list=curr_seqs,
                 seq_padding_masks=curr_masks,
                 rope_cos_list=rope_cos_list,
                 rope_sin_list=rope_sin_list,
+                seq_time_deltas=curr_time_deltas,
+                query_temporal_bias=self.temporal_bias,
+                seq_temporal_bias=self.seq_temporal_bias,
             )
 
         # Output: concatenate all sequences' Q tokens then project via MLP
@@ -1629,7 +2414,8 @@ class PCVRHyFormer(nn.Module):
         output = all_q.view(B, -1)  # (B, Nq*S*D)
         output = self.output_proj(output)  # (B, D)
 
-        return output
+        ns_out = curr_ns if self.use_ns_output_fusion else None
+        return output, ns_out
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
@@ -1637,40 +2423,78 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
+        item_tokens = [item_ns]
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_tok = self._make_user_dense_token(
+                inputs.user_int_feats, inputs.user_dense_feats)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            item_tokens.append(item_dense_tok)
             ns_parts.append(item_dense_tok)
 
+        item_tokens = torch.cat(item_tokens, dim=1)
+        target_emb = self._make_item_repr(item_tokens) if self.use_target_attention else item_tokens.mean(dim=1)
+        item_repr = target_emb if self.use_target_attention else None
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+
+        if self.num_cross_layers > 0:
+            B_ns = ns_tokens.shape[0]
+            ns_flat = ns_tokens.view(B_ns, -1)
+            ns_flat = self.cross_net(ns_flat)
+            ns_tokens = self.cross_ln(ns_flat.view(B_ns, self.num_ns, self.d_model))
+
+        if self.use_se_net:
+            ns_tokens = self.se_gate(ns_tokens)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
+            tg = inputs.seq_time_gaps[domain] if self.use_time_gap else None
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                hash_embs=self._seq_hash_embs[domain] if domain in self._seq_hash_embs else None,
+                time_gap=tg,
+                time_hour_ids=inputs.seq_time_hours[domain],
+                time_weekday_ids=inputs.seq_time_weekdays[domain],
+                time_span_bucket_ids=inputs.seq_time_span_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        # 3. Collect time deltas for temporal attention bias
+        time_delta_list = None
+        if self.use_temporal_bias:
+            time_delta_list = [inputs.seq_time_deltas[domain] for domain in self.seq_domains]
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output = self._run_multi_seq_blocks(
+        # 5. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
+        q_tokens_list = self.query_generator(
+            target_emb, ns_tokens, seq_tokens_list, seq_masks_list)
+
+        # 6. Dropout + MultiSeqHyFormerBlock stack + output projection
+        output, ns_out = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
+            apply_dropout=self.training,
+            time_delta_list=time_delta_list,
         )
 
-        # 5. Classifier
+        # 6.5. NS output fusion (optional)
+        if self.use_ns_output_fusion and ns_out is not None:
+            ns_pooled = ns_out.mean(dim=1)  # (B, D)
+            output = self.ns_output_fusion(torch.cat([output, ns_pooled], dim=-1))
+
+        # 7. Target-item/history explicit match residual (parallel path)
+        if self.use_target_attention:
+            output = self._apply_target_match_residual(
+                output, item_repr, seq_tokens_list, seq_masks_list)
+
+        # 7. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
 
@@ -1680,35 +2504,70 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
+        item_tokens = [item_ns]
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_tok = self._make_user_dense_token(
+                inputs.user_int_feats, inputs.user_dense_feats)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
+            item_tokens.append(item_dense_tok)
             ns_parts.append(item_dense_tok)
 
+        item_tokens = torch.cat(item_tokens, dim=1)
+        target_emb = self._make_item_repr(item_tokens) if self.use_target_attention else item_tokens.mean(dim=1)
+        item_repr = target_emb if self.use_target_attention else None
         ns_tokens = torch.cat(ns_parts, dim=1)
+
+        if self.num_cross_layers > 0:
+            B_ns = ns_tokens.shape[0]
+            ns_flat = ns_tokens.view(B_ns, -1)
+            ns_flat = self.cross_net(ns_flat)
+            ns_tokens = self.cross_ln(ns_flat.view(B_ns, self.num_ns, self.d_model))
+
+        if self.use_se_net:
+            ns_tokens = self.se_gate(ns_tokens)
 
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
+            tg = inputs.seq_time_gaps[domain] if self.use_time_gap else None
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                hash_embs=self._seq_hash_embs[domain] if domain in self._seq_hash_embs else None,
+                time_gap=tg,
+                time_hour_ids=inputs.seq_time_hours[domain],
+                time_weekday_ids=inputs.seq_time_weekdays[domain],
+                time_span_bucket_ids=inputs.seq_time_span_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        time_delta_list = None
+        if self.use_temporal_bias:
+            time_delta_list = [inputs.seq_time_deltas[domain] for domain in self.seq_domains]
 
-        output = self._run_multi_seq_blocks(
+        q_tokens_list = self.query_generator(
+            target_emb, ns_tokens, seq_tokens_list, seq_masks_list)
+
+        output, ns_out = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
+            apply_dropout=False,
+            time_delta_list=time_delta_list,
         )
+
+        if self.use_ns_output_fusion and ns_out is not None:
+            ns_pooled = ns_out.mean(dim=1)
+            output = self.ns_output_fusion(torch.cat([output, ns_pooled], dim=-1))
+
+        if self.use_target_attention:
+            output = self._apply_target_match_residual(
+                output, item_repr, seq_tokens_list, seq_masks_list)
 
         logits = self.clsfier(output)
         return logits, output
