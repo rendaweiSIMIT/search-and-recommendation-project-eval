@@ -142,6 +142,36 @@ TIME_SPAN_BUCKET_BOUNDARIES = np.array([
 # Includes padding=0 plus all np.searchsorted buckets after +1.
 NUM_TIME_SPAN_BUCKETS = len(TIME_SPAN_BUCKET_BOUNDARIES) + 2
 
+# ────────────── Sequence Value Log-Bucketing (B3, exp/v9-mixed-seq-logbucket) ──
+# Several sequence side-info columns are *numeric quantities* (counts/amounts)
+# that the baseline feeds through a raw-value Embedding lookup -- or, when their
+# vocab exceeds emb_skip_threshold, through a hash embedding. Treating an
+# ordinal magnitude as an arbitrary categorical id discards monotonicity and
+# wastes a huge table. EDA (trainedanewlog.txt) flags these columns by a high
+# flat_zero_rate (>~0.4) plus a wide value range. We replace their raw values
+# with log2-spaced magnitude buckets:
+#   bucket 0 = padding, 1 = exact zero, 2..N = log2 magnitude bands.
+VALUE_LOG_BUCKET_BOUNDARIES = np.array([
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
+    1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
+], dtype=np.int64)
+
+# Reported vocab_size for a bucketed column. searchsorted(side='right') gives
+# raw ids in [0, len(boundaries)]; after +1 the bucket ids span [1, len+1],
+# plus padding 0. vocab_size must exceed the max id so the OOB check never
+# triggers, hence len(boundaries)+2.
+NUM_VALUE_BUCKETS = len(VALUE_LOG_BUCKET_BOUNDARIES) + 2
+
+# {seq prefix: {fid, ...}} -- side-info columns to convert to magnitude buckets.
+# Selected from EDA: zero-inflated numeric quantities (flat_zero_rate > 0.4),
+# excluding small-range categoricals and high-cardinality opaque id columns.
+VALUE_BUCKET_SEQ_FIDS = {
+    'domain_a_seq': {38, 43, 44, 45},
+    'domain_b_seq': {72, 73, 74, 76, 78, 79, 88},
+    'domain_c_seq': {31},
+    'domain_d_seq': {20, 21, 22},
+}
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -334,22 +364,37 @@ class PCVRParquetDataset(IterableDataset):
         self.sideinfo_fids: Dict[str, List[int]] = {}
         self._seq_prefix: Dict[str, str] = {}
         self._seq_maxlen: Dict[str, int] = {}
+        # B3: per-domain set of side-info slot indices to log-bucket.
+        self._seq_value_bucket_slots: Dict[str, set] = {}
 
         for domain in self.seq_domains:
             cfg = self._seq_cfg[domain]
-            self._seq_prefix[domain] = cfg['prefix']
+            prefix = cfg['prefix']
+            self._seq_prefix[domain] = prefix
             ts_fid = cfg['ts_fid']
             self.ts_fids[domain] = ts_fid
 
             all_fids = [fid for fid, vs in cfg['features']]
             self.seq_feature_ids[domain] = all_fids
-            self.seq_vocab_sizes[domain] = {fid: vs for fid, vs in cfg['features']}
+            # B3 (exp/v9-mixed-seq-logbucket): zero-inflated numeric quantity
+            # columns are converted to log-magnitude buckets, so they report a
+            # small fixed vocab (NUM_VALUE_BUCKETS) instead of their raw range.
+            bucket_fids = VALUE_BUCKET_SEQ_FIDS.get(prefix, set())
+            self.seq_vocab_sizes[domain] = {
+                fid: (NUM_VALUE_BUCKETS if fid in bucket_fids else vs)
+                for fid, vs in cfg['features']
+            }
 
             sideinfo = [fid for fid in all_fids if fid != ts_fid]
             self.sideinfo_fids[domain] = sideinfo
             self.seq_domain_vocab_sizes[domain] = [
                 self.seq_vocab_sizes[domain][fid] for fid in sideinfo
             ]
+            # Slot indices (positions in `sideinfo`) whose raw values are
+            # log-bucketed in `_convert_batch`.
+            self._seq_value_bucket_slots[domain] = {
+                slot for slot, fid in enumerate(sideinfo) if fid in bucket_fids
+            }
 
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
@@ -640,6 +685,22 @@ class PCVRParquetDataset(IterableDataset):
 
             # Values <= 0 -> 0.
             out[out <= 0] = 0
+
+            # B3: log-magnitude bucketing for zero-inflated numeric columns.
+            # Runs after the <=0 mapping (so -1/0 collapse to the exact-zero
+            # bucket) and before the OOB check (bucket ids are already small
+            # and in-range for the overridden vocab_size).
+            bucket_slots = self._seq_value_bucket_slots.get(domain)
+            if bucket_slots:
+                pad_mask = (np.arange(max_len)[None, :] >= lengths[:, None])
+                for c in bucket_slots:
+                    raw = np.searchsorted(
+                        VALUE_LOG_BUCKET_BOUNDARIES,
+                        out[:, c, :].ravel(), side='right',
+                    ).reshape(B, max_len)
+                    bucket_ids = raw + 1                 # 1=exact zero, 2..=bands
+                    bucket_ids[pad_mask] = 0             # restore padding
+                    out[:, c, :] = bucket_ids
 
             # Check out-of-bound values per feature's vocab_size.
             # vs==0 means no vocab info; force the whole slice to 0 so that
