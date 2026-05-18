@@ -147,6 +147,38 @@ def build_user_sparse_dense_pair_specs(
     return specs
 
 
+def _resolve_dense_fid_offsets(
+    user_dense_schema: FeatureSchema, fids_str: str, label: str,
+) -> List[Tuple[int, int]]:
+    """Translate a comma-separated list of user_dense fids (e.g. "61") into
+    ``(offset, length)`` slices inside the flat user_dense vector.
+
+    Mirrors ``_resolve_dense_fid_offsets`` in train.py. Needed because
+    train_config.json only records the fid STRINGS (--additive_dense_fids
+    / --gating_dense_fids) -- the resolved offsets depend on the schema
+    and must be re-derived here so the eval-time model has the same
+    pretrained-adapter shape the checkpoint was trained with. Unknown
+    fids are skipped (the path degrades to a no-op).
+    """
+    if not fids_str:
+        return []
+    try:
+        fids = [int(x.strip()) for x in fids_str.split(',') if x.strip()]
+    except ValueError:
+        logging.warning(f"Could not parse {label}={fids_str!r}, disabling path")
+        return []
+    offsets: List[Tuple[int, int]] = []
+    for fid in fids:
+        if fid in user_dense_schema._fid_to_entry:
+            offset, length = user_dense_schema.get_offset_length(fid)
+            offsets.append((offset, length))
+        else:
+            logging.warning(f"{label}={fid} not in user_dense_schema; skipping")
+    if offsets:
+        logging.info(f"{label} resolved: fids={fids} -> slices={offsets}")
+    return offsets
+
+
 def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
     """Parse a string like 'seq_a:256,seq_b:256,...' into a dict."""
     seq_max_lens: Dict[str, int] = {}
@@ -461,6 +493,23 @@ def main() -> None:
     logging.info(f"Total test samples: {test_dataset.num_rows}")
 
     model_cfg = resolve_model_cfg(train_config)
+
+    # Pretrained-mixed adapters: train_config.json records only the fid
+    # STRINGS (--additive_dense_fids / --gating_dense_fids), not the
+    # resolved (offset, length) slices. Re-resolve them here against the
+    # eval-time schema so the model has the same adapter shape as the
+    # checkpoint -- otherwise strict-load fails on the unexpected
+    # user_additive_adapter / user_gating_adapter keys.
+    model_cfg['additive_dense_offsets'] = _resolve_dense_fid_offsets(
+        test_dataset.user_dense_schema,
+        train_config.get('additive_dense_fids', ''),
+        '--additive_dense_fids',
+    )
+    model_cfg['gating_dense_offsets'] = _resolve_dense_fid_offsets(
+        test_dataset.user_dense_schema,
+        train_config.get('gating_dense_fids', ''),
+        '--gating_dense_fids',
+    )
 
     ns_groups_json = train_config.get("ns_groups_json", None)
     if ns_groups_json:
