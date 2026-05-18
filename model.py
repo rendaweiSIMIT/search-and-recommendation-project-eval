@@ -1737,11 +1737,23 @@ class PCVRHyFormer(nn.Module):
             (int(o), int(l)) for o, l in gating_dense_offsets)
         self.has_additive_dense = bool(self.additive_dense_offsets)
         self.has_gating_dense = bool(self.gating_dense_offsets)
-        self.user_dense_proj_dim = user_dense_dim
+        # Dense slices already routed through dedicated paths must NOT be
+        # re-fed into the generic user-dense projection (avoids double
+        # counting the same input). v9 excludes only the 62-66 pair region;
+        # C5 (exp/v9-mixed-dense-proj-exclude) additionally excludes the
+        # additive (fid 61, Meta SUM) and gating (fid 87, Tencent LFM4Ads)
+        # slices, so 61/87 reach the model solely through their adapters.
+        keep_mask = torch.ones(max(int(user_dense_dim), 0), dtype=torch.bool)
         if user_dense_dim >= USER_DENSE_PAIR_END:
-            self.user_dense_proj_dim = (
-                user_dense_dim - (USER_DENSE_PAIR_END - USER_DENSE_PAIR_START)
-            )
+            keep_mask[USER_DENSE_PAIR_START:USER_DENSE_PAIR_END] = False
+        for off, length in self.additive_dense_offsets:
+            keep_mask[off:off + length] = False
+        for off, length in self.gating_dense_offsets:
+            keep_mask[off:off + length] = False
+        # Non-persistent: deterministic from schema, recomputed at load time,
+        # so it stays out of the checkpoint state_dict.
+        self.register_buffer('_dense_proj_keep_mask', keep_mask, persistent=False)
+        self.user_dense_proj_dim = int(keep_mask.sum().item())
 
         # ================== NS Tokens Construction ==================
 
@@ -2244,13 +2256,10 @@ class PCVRHyFormer(nn.Module):
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
     def _make_user_dense_proj_input(self, user_dense_feats: torch.Tensor) -> torch.Tensor:
-        """Drops fid62-66 dense values before the ordinary dense-token projection."""
-        if user_dense_feats.shape[1] < USER_DENSE_PAIR_END:
-            return user_dense_feats
-        return torch.cat([
-            user_dense_feats[:, :USER_DENSE_PAIR_START],
-            user_dense_feats[:, USER_DENSE_PAIR_END:],
-        ], dim=1)
+        """Selects the generic-projection dense slice: drops the 62-66 pair
+        region plus the additive (fid 61) and gating (fid 87) slices, which
+        are already routed through their own dedicated paths (C5)."""
+        return user_dense_feats[:, self._dense_proj_keep_mask]
 
     def _make_user_dense_token(
         self,
