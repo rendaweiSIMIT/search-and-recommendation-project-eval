@@ -765,6 +765,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    valid_from_head: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -794,28 +795,39 @@ def get_pcvr_data(
     # for training and return valid_loader=None. The trainer detects None
     # and skips evaluate() / EarlyStopping, training a fixed num_epochs.
     no_val = valid_ratio <= 0
+    n_valid_rgs = 0 if no_val else max(1, int(total_rgs * valid_ratio))
+
+    # (start, end) Row Group slices for train / valid.
+    # valid_from_head: validation is the OLDEST n_valid_rgs Row Groups -- this
+    # keeps the most recent (most test-relevant) data IN training and gives the
+    # val set fully-matured labels. Otherwise validation is the most recent
+    # tail (standard time-ordered split).
     if no_val:
-        n_valid_rgs = 0
-        n_train_rgs = total_rgs
+        train_range, valid_range = (0, total_rgs), None
+    elif valid_from_head:
+        valid_range, train_range = (0, n_valid_rgs), (n_valid_rgs, total_rgs)
     else:
-        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-        n_train_rgs = total_rgs - n_valid_rgs
+        train_range = (0, total_rgs - n_valid_rgs)
+        valid_range = (total_rgs - n_valid_rgs, total_rgs)
 
-    # train_ratio: use only the first N% of the training Row Groups.
+    # train_ratio: keep only the first N% of the training Row Groups.
     if train_ratio < 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+        ts, te = train_range
+        train_range = (ts, ts + max(1, int((te - ts) * train_ratio)))
+        logging.info(f"train_ratio={train_ratio}: using train Row Groups {train_range}")
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = 0 if no_val else sum(r[2] for r in rg_info[n_train_rgs:])
+    train_rows = sum(r[2] for r in rg_info[train_range[0]:train_range[1]])
+    valid_rows = (0 if valid_range is None
+                  else sum(r[2] for r in rg_info[valid_range[0]:valid_range[1]]))
 
     if no_val:
-        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+        logging.info(f"Row Group split: train RG {train_range} ({train_rows} rows), "
                      f"NO VALIDATION (valid_ratio={valid_ratio}); trainer will "
                      f"skip evaluate()/EarlyStopping.")
     else:
-        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                     f"{n_valid_rgs} valid ({valid_rows} rows)")
+        pos = 'head/oldest' if valid_from_head else 'tail/most-recent'
+        logging.info(f"Row Group split: train RG {train_range} ({train_rows} rows), "
+                     f"valid RG {valid_range} ({valid_rows} rows), valid from {pos}.")
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -824,7 +836,7 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
+        row_group_range=train_range,
         clip_vocab=clip_vocab,
     )
 
@@ -839,7 +851,7 @@ def get_pcvr_data(
         num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
     )
 
-    if no_val:
+    if valid_range is None:
         valid_loader = None
     else:
         valid_dataset = PCVRParquetDataset(
@@ -849,7 +861,7 @@ def get_pcvr_data(
             seq_max_lens=seq_max_lens,
             shuffle=False,
             buffer_batches=0,
-            row_group_range=(n_train_rgs, total_rgs),
+            row_group_range=valid_range,
             clip_vocab=clip_vocab,
         )
         valid_loader = DataLoader(
