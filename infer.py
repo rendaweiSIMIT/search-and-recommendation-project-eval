@@ -331,6 +331,7 @@ def build_model(
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
         user_sparse_dense_pair_specs=user_sparse_dense_pair_specs,
+        recency_dim=dataset.recency_dim,
         **model_cfg,
     ).to(device)
 
@@ -445,6 +446,7 @@ def _batch_to_model_input(
         seq_time_hours=seq_time_hours,
         seq_time_weekdays=seq_time_weekdays,
         seq_time_span_buckets=seq_time_span_buckets,
+        recency_feats=device_batch["recency_feats"],
     )
 
 

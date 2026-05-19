@@ -21,6 +21,7 @@ class ModelInput(NamedTuple):
     seq_time_hours: dict    # {domain: tensor [B, L]} 0=padding, 1..24
     seq_time_weekdays: dict # {domain: tensor [B, L]} 0=padding, 1..7
     seq_time_span_buckets: dict  # {domain: tensor [B, L]} inter-event gap buckets
+    recency_feats: torch.Tensor  # [B, F] per-domain recency / activity scalars
 
 
 USER_DENSE_PAIR_START = 256
@@ -1709,6 +1710,9 @@ class PCVRHyFormer(nn.Module):
         # only covers 62-66), so this path is orthogonal to v9.
         additive_dense_offsets: Tuple[Tuple[int, int], ...] = (),
         gating_dense_offsets: Tuple[Tuple[int, int], ...] = (),
+        # Recency / activity scalar features (exp/v9-mixed-dpe-recency):
+        # number of per-row recency scalars. 0 disables the recency adapter.
+        recency_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -2082,6 +2086,22 @@ class PCVRHyFormer(nn.Module):
             logging.info(
                 f"Pretrained-gating (LFM4Ads-style): {gating_dim}-d "
                 f"(offsets={self.gating_dense_offsets}) -> {d_model}-d adapter")
+
+        # ============ Recency / activity adapter (exp/v9-mixed-dpe-recency) ===
+        # Per-domain recency/activity scalars -> 2-layer MLP -> residual added
+        # to the pooled output, same placement as the pretrained-dense
+        # adapters. recency_dim == 0 -> no adapter (dense-proj-exclude-equiv).
+        self.recency_dim = int(recency_dim)
+        self.has_recency = self.recency_dim > 0
+        if self.has_recency:
+            self.recency_adapter = nn.Sequential(
+                nn.Linear(self.recency_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"recency adapter: {self.recency_dim}-d -> {d_model}-d")
 
         # Initialize parameters
         self._init_params()
@@ -2506,6 +2526,15 @@ class PCVRHyFormer(nn.Module):
             output = output + residual
         return output
 
+    def _apply_recency(
+        self, output: torch.Tensor, recency_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Add the recency / activity adapter residual to the pooled output.
+        No-op when recency is disabled (recency_dim == 0)."""
+        if not self.has_recency:
+            return output
+        return output + self.recency_adapter(recency_feats)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -2586,6 +2615,9 @@ class PCVRHyFormer(nn.Module):
         # 7b. Paper-faithful pretrained-embedding paths (exp/pretrained-mixed)
         output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
 
+        # 7c. Recency / activity adapter (exp/v9-mixed-dpe-recency)
+        output = self._apply_recency(output, inputs.recency_feats)
+
         # 7. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -2663,6 +2695,9 @@ class PCVRHyFormer(nn.Module):
 
         # Paper-faithful pretrained-embedding paths (exp/pretrained-mixed)
         output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
+
+        # Recency / activity adapter (exp/v9-mixed-dpe-recency)
+        output = self._apply_recency(output, inputs.recency_feats)
 
         logits = self.clsfier(output)
         return logits, output

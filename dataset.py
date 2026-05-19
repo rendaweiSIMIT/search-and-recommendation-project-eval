@@ -142,6 +142,24 @@ TIME_SPAN_BUCKET_BOUNDARIES = np.array([
 # Includes padding=0 plus all np.searchsorted buckets after +1.
 NUM_TIME_SPAN_BUCKETS = len(TIME_SPAN_BUCKET_BOUNDARIES) + 2
 
+# ─────────── Recency / activity features (exp/v9-mixed-dpe-recency) ───────────
+# Per behavior domain (a/b/c/d), 4 log1p-compressed scalars summarising the
+# user's behavior dynamics, derived from the per-event time_diff that the
+# dataset already computes for time-bucketing:
+#   recency_log : log1p(seconds since the most recent event)
+#   logcnt_1h   : log1p(#events within the last 3600 s)
+#   logcnt_1d   : log1p(#events within the last 86400 s)
+#   loglen      : log1p(true pre-truncation event count)
+# 4 domains x 4 -> RECENCY_FEAT_DIM. These are relative durations, not
+# absolute calendar time, so they avoid the train/test time-shift trap.
+RECENCY_FEATS_PER_DOMAIN = 4
+RECENCY_FEAT_DIM = 4 * RECENCY_FEATS_PER_DOMAIN  # 4 domains
+
+# recency_log value for a domain in which the user has no event at all
+# ("acted infinitely long ago"); chosen well above any real recency_log
+# (real range ~0..18).
+RECENCY_EMPTY_SENTINEL = 20.0
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -199,6 +217,8 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        # recency / activity features emitted per row (exp/v9-mixed-dpe-recency).
+        self.recency_dim = RECENCY_FEAT_DIM
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -609,7 +629,10 @@ class PCVRParquetDataset(IterableDataset):
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
-        for domain in self.seq_domains:
+        # recency_feats: RECENCY_FEATS_PER_DOMAIN scalars per domain, filled
+        # in below from each domain's time_diff (exp/v9-mixed-dpe-recency).
+        recency_feats = np.zeros((B, RECENCY_FEAT_DIM), dtype=np.float32)
+        for d_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
@@ -693,6 +716,27 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+            # ---- recency / activity features (exp/v9-mixed-dpe-recency) ----
+            # 4 log1p scalars for this domain, reusing time_diff / ts_padded /
+            # ts_offs computed above. Fully vectorized, no Python loop.
+            if ts_ci is not None:
+                valid = ts_padded > 0
+                has_event = valid.any(axis=1)
+                # recency = smallest time_diff over valid positions; empty
+                # domain -> sentinel ("acted infinitely long ago").
+                td_for_min = np.where(valid, time_diff, np.iinfo(np.int64).max)
+                recency_log = np.log1p(td_for_min.min(axis=1).astype(np.float64))
+                recency_log[~has_event] = RECENCY_EMPTY_SENTINEL
+                cnt_1h = (valid & (time_diff <= 3600)).sum(axis=1)
+                cnt_1d = (valid & (time_diff <= 86400)).sum(axis=1)
+                # true (pre-truncation) event count from the ts column offsets
+                true_len = (ts_offs[1:] - ts_offs[:-1]).astype(np.float64)
+                c0 = d_idx * RECENCY_FEATS_PER_DOMAIN
+                recency_feats[:, c0] = recency_log
+                recency_feats[:, c0 + 1] = np.log1p(cnt_1h)
+                recency_feats[:, c0 + 2] = np.log1p(cnt_1d)
+                recency_feats[:, c0 + 3] = np.log1p(true_len)
+
             # Raw log-compressed time deltas for Temporal Attention Bias.
             time_delta = self._buf_seq_td[domain][:B]
             time_delta[:] = 0.0
@@ -749,6 +793,8 @@ class PCVRParquetDataset(IterableDataset):
                 span_ids[gaps <= 0] = 0
                 time_span[:] = span_ids
             result[f'{domain}_time_span_bucket'] = torch.from_numpy(time_span.copy())
+
+        result['recency_feats'] = torch.from_numpy(recency_feats)
 
         return result
 
