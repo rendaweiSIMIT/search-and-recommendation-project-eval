@@ -164,6 +164,8 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        id_stats_path: Optional[str] = None,
+        id_stats_loo: bool = False,
     ) -> None:
         """
         Args:
@@ -202,6 +204,33 @@ class PCVRParquetDataset(IterableDataset):
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
+
+        # ---- ID statistical encoding (exp/v9-mixed-dpe-id-stats) ----
+        # Loads pre-computed item/user (count, positive_count) tables. When
+        # id_stats_loo=True the current row's own label is subtracted out of
+        # the item CVR (leave-one-out target encoding) -- set True only for
+        # the actual training dataset, never for validation/test.
+        self._id_stats_loo = id_stats_loo
+        self._has_id_stats = False
+        self.id_stats_dim = 0
+        self._item_count = self._item_pos = self._user_count = None
+        if id_stats_path and os.path.exists(id_stats_path):
+            d = np.load(id_stats_path)
+            item_ids = d['item_ids'].tolist()
+            self._item_count = dict(zip(item_ids, d['item_count'].tolist()))
+            self._item_pos = dict(zip(item_ids, d['item_pos'].tolist()))
+            self._user_count = dict(zip(d['user_ids'].tolist(),
+                                        d['user_count'].tolist()))
+            self._id_stats_g = float(d['global_cvr'])
+            self._id_stats_alpha = float(d['alpha'])
+            self._has_id_stats = True
+            self.id_stats_dim = 3  # item_count_log, item_cvr, user_count_log
+            logging.info(
+                f"id-stats loaded from {id_stats_path}: "
+                f"{len(self._item_count)} items, {len(self._user_count)} users, "
+                f"global_cvr={self._id_stats_g:.6f}, "
+                f"alpha={self._id_stats_alpha}, "
+                f"LOO={'on' if id_stats_loo else 'off'}")
 
         # Build the list of Row Groups.
         self._rg_list = []
@@ -608,6 +637,38 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
+        # ---- ID statistical encoding features (exp/v9-mixed-dpe-id-stats) ----
+        # Per-row scalars: log1p(item count), smoothed item CVR (centered by
+        # subtracting the global rate), log1p(user count). For the training
+        # dataset (id_stats_loo=True) the item CVR uses leave-one-out: this
+        # row's own label is removed from the statistic, so the feature never
+        # leaks its target. Validation/test use the plain statistic.
+        if self._has_id_stats:
+            g, a = self._id_stats_g, self._id_stats_alpha
+            item_id_arr = (batch.column(self._col_idx['item_id']).fill_null(0)
+                           .to_numpy(zero_copy_only=False).astype(np.int64))
+            user_id_arr = (batch.column(self._col_idx['user_id']).fill_null(0)
+                           .to_numpy(zero_copy_only=False).astype(np.int64))
+            feats = np.zeros((B, 3), dtype=np.float32)
+            ic_get, ip_get, uc_get = (self._item_count.get,
+                                      self._item_pos.get, self._user_count.get)
+            for i in range(B):
+                ic = ic_get(int(item_id_arr[i]), 0)
+                ip = ip_get(int(item_id_arr[i]), 0)
+                uc = uc_get(int(user_id_arr[i]), 0)
+                feats[i, 0] = np.log1p(ic)
+                if self._id_stats_loo:
+                    num = ip - int(labels[i]) + a * g
+                    den = ic - 1 + a
+                else:
+                    num = ip + a * g
+                    den = ic + a
+                feats[i, 1] = num / den - g          # centered smoothed CVR
+                feats[i, 2] = np.log1p(uc)
+            result['id_stats_feats'] = torch.from_numpy(feats)
+        else:
+            result['id_stats_feats'] = torch.zeros(B, 0, dtype=torch.float32)
+
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
@@ -765,6 +826,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    id_stats_path: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -813,6 +875,8 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        id_stats_path=id_stats_path,
+        id_stats_loo=True,   # leave-one-out: this is the actual training set
     )
 
     use_cuda = torch.cuda.is_available()
@@ -835,6 +899,8 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        id_stats_path=id_stats_path,
+        id_stats_loo=False,  # val rows are not in the stats -> plain lookup
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

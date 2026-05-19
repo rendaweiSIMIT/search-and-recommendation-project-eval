@@ -21,6 +21,7 @@ class ModelInput(NamedTuple):
     seq_time_hours: dict    # {domain: tensor [B, L]} 0=padding, 1..24
     seq_time_weekdays: dict # {domain: tensor [B, L]} 0=padding, 1..7
     seq_time_span_buckets: dict  # {domain: tensor [B, L]} inter-event gap buckets
+    id_stats_feats: torch.Tensor  # [B, F] item/user count + smoothed-CVR scalars
 
 
 USER_DENSE_PAIR_START = 256
@@ -1709,6 +1710,9 @@ class PCVRHyFormer(nn.Module):
         # only covers 62-66), so this path is orthogonal to v9.
         additive_dense_offsets: Tuple[Tuple[int, int], ...] = (),
         gating_dense_offsets: Tuple[Tuple[int, int], ...] = (),
+        # ID statistical-encoding features (exp/v9-mixed-dpe-id-stats):
+        # number of per-row item/user count + smoothed-CVR scalars. 0 disables.
+        id_stats_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -2082,6 +2086,23 @@ class PCVRHyFormer(nn.Module):
             logging.info(
                 f"Pretrained-gating (LFM4Ads-style): {gating_dim}-d "
                 f"(offsets={self.gating_dense_offsets}) -> {d_model}-d adapter")
+
+        # ============ ID statistical-encoding adapter (id-stats) ============
+        # exp/v9-mixed-dpe-id-stats: per-row item/user count + smoothed-CVR
+        # scalars -> 2-layer MLP -> residual added to the pooled output, in
+        # the same spirit as the pretrained-dense adapters above. id_stats_dim
+        # == 0 -> no adapter, the model is dense-proj-exclude-equivalent.
+        self.id_stats_dim = int(id_stats_dim)
+        self.has_id_stats = self.id_stats_dim > 0
+        if self.has_id_stats:
+            self.id_stats_adapter = nn.Sequential(
+                nn.Linear(self.id_stats_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"id-stats adapter: {self.id_stats_dim}-d -> {d_model}-d")
 
         # Initialize parameters
         self._init_params()
@@ -2506,6 +2527,15 @@ class PCVRHyFormer(nn.Module):
             output = output + residual
         return output
 
+    def _apply_id_stats(
+        self, output: torch.Tensor, id_stats_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Add the ID statistical-encoding adapter residual to the pooled
+        output. No-op when id-stats is disabled (id_stats_dim == 0)."""
+        if not self.has_id_stats:
+            return output
+        return output + self.id_stats_adapter(id_stats_feats)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -2586,6 +2616,9 @@ class PCVRHyFormer(nn.Module):
         # 7b. Paper-faithful pretrained-embedding paths (exp/pretrained-mixed)
         output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
 
+        # 7c. ID statistical-encoding adapter (exp/v9-mixed-dpe-id-stats)
+        output = self._apply_id_stats(output, inputs.id_stats_feats)
+
         # 7. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -2663,6 +2696,9 @@ class PCVRHyFormer(nn.Module):
 
         # Paper-faithful pretrained-embedding paths (exp/pretrained-mixed)
         output = self._apply_pretrained_paths(output, inputs.user_dense_feats)
+
+        # ID statistical-encoding adapter (exp/v9-mixed-dpe-id-stats)
+        output = self._apply_id_stats(output, inputs.id_stats_feats)
 
         logits = self.clsfier(output)
         return logits, output

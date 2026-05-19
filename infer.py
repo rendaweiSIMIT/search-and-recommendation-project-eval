@@ -331,6 +331,7 @@ def build_model(
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
         user_sparse_dense_pair_specs=user_sparse_dense_pair_specs,
+        id_stats_dim=dataset.id_stats_dim,
         **model_cfg,
     ).to(device)
 
@@ -445,6 +446,7 @@ def _batch_to_model_input(
         seq_time_hours=seq_time_hours,
         seq_time_weekdays=seq_time_weekdays,
         seq_time_span_buckets=seq_time_span_buckets,
+        id_stats_feats=device_batch["id_stats_feats"],
     )
 
 
@@ -480,6 +482,14 @@ def main() -> None:
     batch_size = int(train_config.get("batch_size", _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get("num_workers", _FALLBACK_NUM_WORKERS))
 
+    # ID statistical encoding: id_stats.npz is shipped next to the checkpoint
+    # (copied there by the trainer). Present -> the feature is re-attached and
+    # id_stats_dim>0; absent -> the model was trained without it (dim 0).
+    id_stats_path = os.path.join(model_dir, "id_stats.npz")
+    if not os.path.exists(id_stats_path):
+        id_stats_path = None
+    logging.info(f"id_stats path: {id_stats_path}")
+
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -488,6 +498,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        id_stats_path=id_stats_path,
     )
 
     logging.info(f"Total test samples: {test_dataset.num_rows}")
