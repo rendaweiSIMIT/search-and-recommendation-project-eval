@@ -160,6 +160,26 @@ RECENCY_FEAT_DIM = 4 * RECENCY_FEATS_PER_DOMAIN  # 4 domains
 # (real range ~0..18).
 RECENCY_EMPTY_SENTINEL = 20.0
 
+# ───────── User temporal profile (exp/v9-mixed-dpe-recency-tprofile) ─────────
+# Per domain (a/b/c/d), 2 log1p scalars summarising the user's broader
+# temporal pattern that the sequence encoder can't easily extract:
+#   account_age_log : log1p(seconds since the OLDEST valid event)
+#                     -- "how long has this user been doing this kind of
+#                     behavior"; recency captures min(time_diff), this is
+#                     max(time_diff).
+#   night_frac      : fraction of user's valid events whose calendar
+#                     hour falls in 22:00-03:00 (NIGHT_HOUR_IDS),
+#                     aligned with the cross-midnight test window
+#                     (Sun 23:40 - Mon 01:13).
+# 4 domains x 2 -> TPROFILE_FEAT_DIM. All relative or aggregated -- never
+# the sample's own absolute time (which sank earlier time-feature attempts).
+TPROFILE_FEATS_PER_DOMAIN = 2
+TPROFILE_FEAT_DIM = 4 * TPROFILE_FEATS_PER_DOMAIN  # 8
+
+# Hour IDs (dataset stores 1..24; padding=0) considered "night",
+# centred on the test window.
+NIGHT_HOUR_IDS = (23, 24, 1, 2, 3)
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -219,6 +239,9 @@ class PCVRParquetDataset(IterableDataset):
         self.is_training = is_training
         # recency / activity features emitted per row (exp/v9-mixed-dpe-recency).
         self.recency_dim = RECENCY_FEAT_DIM
+        # per-row user temporal-profile scalars
+        # (exp/v9-mixed-dpe-recency-tprofile).
+        self.tprofile_dim = TPROFILE_FEAT_DIM
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -632,6 +655,9 @@ class PCVRParquetDataset(IterableDataset):
         # recency_feats: RECENCY_FEATS_PER_DOMAIN scalars per domain, filled
         # in below from each domain's time_diff (exp/v9-mixed-dpe-recency).
         recency_feats = np.zeros((B, RECENCY_FEAT_DIM), dtype=np.float32)
+        # user temporal profile (exp/v9-mixed-dpe-recency-tprofile): 4 domains
+        # x (account_age_log, night_frac) -> TPROFILE_FEAT_DIM scalars.
+        tprofile_feats = np.zeros((B, TPROFILE_FEAT_DIM), dtype=np.float32)
         for d_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
@@ -737,6 +763,29 @@ class PCVRParquetDataset(IterableDataset):
                 recency_feats[:, c0 + 2] = np.log1p(cnt_1d)
                 recency_feats[:, c0 + 3] = np.log1p(true_len)
 
+            # ---- user temporal profile (exp/v9-mixed-dpe-recency-tprofile) ----
+            # account_age_log = log1p(max time_diff = oldest valid event);
+            # night_frac = fraction of valid events with hour in NIGHT_HOUR_IDS.
+            if ts_ci is not None:
+                valid_t = ts_padded > 0
+                # max time_diff over valid -> oldest event age
+                td_for_max = np.where(valid_t, time_diff, 0)
+                account_age_log = np.log1p(td_for_max.max(axis=1).astype(np.float64))
+                # night fraction: derive hour ids from ts_padded (1..24, pad=0)
+                hour_ids_local = ((ts_padded // 3600) % 24 + 1).astype(np.int64)
+                hour_ids_local[~valid_t] = 0
+                night_mask = np.zeros_like(valid_t, dtype=bool)
+                for _h in NIGHT_HOUR_IDS:
+                    night_mask |= (hour_ids_local == _h)
+                valid_count = valid_t.sum(axis=1)
+                denom = valid_count.clip(min=1).astype(np.float64)
+                night_frac = night_mask.sum(axis=1) / denom
+                has_event_t = valid_count > 0
+                night_frac = np.where(has_event_t, night_frac, 0.0)
+                c1 = d_idx * TPROFILE_FEATS_PER_DOMAIN
+                tprofile_feats[:, c1] = account_age_log
+                tprofile_feats[:, c1 + 1] = night_frac
+
             # Raw log-compressed time deltas for Temporal Attention Bias.
             time_delta = self._buf_seq_td[domain][:B]
             time_delta[:] = 0.0
@@ -795,6 +844,7 @@ class PCVRParquetDataset(IterableDataset):
             result[f'{domain}_time_span_bucket'] = torch.from_numpy(time_span.copy())
 
         result['recency_feats'] = torch.from_numpy(recency_feats)
+        result['tprofile_feats'] = torch.from_numpy(tprofile_feats)
 
         return result
 

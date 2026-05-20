@@ -22,6 +22,7 @@ class ModelInput(NamedTuple):
     seq_time_weekdays: dict # {domain: tensor [B, L]} 0=padding, 1..7
     seq_time_span_buckets: dict  # {domain: tensor [B, L]} inter-event gap buckets
     recency_feats: torch.Tensor  # [B, F] per-domain recency / activity scalars
+    tprofile_feats: torch.Tensor # [B, F] per-domain user temporal profile (age, night frac)
 
 
 USER_DENSE_PAIR_START = 256
@@ -1713,6 +1714,9 @@ class PCVRHyFormer(nn.Module):
         # Recency / activity scalar features (exp/v9-mixed-dpe-recency):
         # number of per-row recency scalars. 0 disables the recency adapter.
         recency_dim: int = 0,
+        # User temporal profile scalars (exp/v9-mixed-dpe-recency-tprofile):
+        # account age + night-hour fraction per domain. 0 disables.
+        tprofile_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -2102,6 +2106,24 @@ class PCVRHyFormer(nn.Module):
             )
             logging.info(
                 f"recency adapter: {self.recency_dim}-d -> {d_model}-d")
+
+        # ============ Temporal profile adapter (tprofile) ============
+        # exp/v9-mixed-dpe-recency-tprofile: per-row user temporal-profile
+        # scalars (account age, night-hour fraction per domain) -> 2-layer
+        # MLP -> residual to pooled output. Independent module, orthogonal
+        # to recency (recency = min(time_diff), tprofile = max(time_diff)
+        # + hour-distribution). tprofile_dim == 0 -> no adapter.
+        self.tprofile_dim = int(tprofile_dim)
+        self.has_tprofile = self.tprofile_dim > 0
+        if self.has_tprofile:
+            self.tprofile_adapter = nn.Sequential(
+                nn.Linear(self.tprofile_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"tprofile adapter: {self.tprofile_dim}-d -> {d_model}-d")
 
         # Initialize parameters
         self._init_params()
@@ -2535,6 +2557,15 @@ class PCVRHyFormer(nn.Module):
             return output
         return output + self.recency_adapter(recency_feats)
 
+    def _apply_tprofile(
+        self, output: torch.Tensor, tprofile_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Add the temporal-profile adapter residual to the pooled output.
+        No-op when tprofile is disabled (tprofile_dim == 0)."""
+        if not self.has_tprofile:
+            return output
+        return output + self.tprofile_adapter(tprofile_feats)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -2618,6 +2649,9 @@ class PCVRHyFormer(nn.Module):
         # 7c. Recency / activity adapter (exp/v9-mixed-dpe-recency)
         output = self._apply_recency(output, inputs.recency_feats)
 
+        # 7d. Temporal profile adapter (exp/v9-mixed-dpe-recency-tprofile)
+        output = self._apply_tprofile(output, inputs.tprofile_feats)
+
         # 7. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -2698,6 +2732,9 @@ class PCVRHyFormer(nn.Module):
 
         # Recency / activity adapter (exp/v9-mixed-dpe-recency)
         output = self._apply_recency(output, inputs.recency_feats)
+
+        # Temporal profile adapter (exp/v9-mixed-dpe-recency-tprofile)
+        output = self._apply_tprofile(output, inputs.tprofile_feats)
 
         logits = self.clsfier(output)
         return logits, output
