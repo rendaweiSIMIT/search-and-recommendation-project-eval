@@ -22,6 +22,7 @@ class ModelInput(NamedTuple):
     seq_time_weekdays: dict # {domain: tensor [B, L]} 0=padding, 1..7
     seq_time_span_buckets: dict  # {domain: tensor [B, L]} inter-event gap buckets
     recency_feats: torch.Tensor  # [B, F] per-domain recency / activity scalars
+    agg_feats: torch.Tensor      # [B, F] per-column user-history aggregate scalars
 
 
 USER_DENSE_PAIR_START = 256
@@ -1713,6 +1714,9 @@ class PCVRHyFormer(nn.Module):
         # Recency / activity scalar features (exp/v9-mixed-dpe-recency):
         # number of per-row recency scalars. 0 disables the recency adapter.
         recency_dim: int = 0,
+        # Per-column user-history aggregate scalars
+        # (exp/v9-mixed-dpe-recency-aggs). 0 disables the agg adapter.
+        agg_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -2102,6 +2106,23 @@ class PCVRHyFormer(nn.Module):
             )
             logging.info(
                 f"recency adapter: {self.recency_dim}-d -> {d_model}-d")
+
+        # ============ Per-column aggregate adapter (recency-aggs) ============
+        # exp/v9-mixed-dpe-recency-aggs: per-row scalars summarising the user's
+        # history values for specific seq columns (uniform mean / max), chosen
+        # by EDA's via_mean / via_max 1-D AUC. Same 2-layer MLP -> residual
+        # pattern as the other adapters. agg_dim == 0 -> no adapter.
+        self.agg_dim = int(agg_dim)
+        self.has_agg = self.agg_dim > 0
+        if self.has_agg:
+            self.agg_adapter = nn.Sequential(
+                nn.Linear(self.agg_dim, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, d_model),
+                nn.LayerNorm(d_model),
+            )
+            logging.info(
+                f"agg adapter: {self.agg_dim}-d -> {d_model}-d")
 
         # Initialize parameters
         self._init_params()
@@ -2535,6 +2556,15 @@ class PCVRHyFormer(nn.Module):
             return output
         return output + self.recency_adapter(recency_feats)
 
+    def _apply_agg(
+        self, output: torch.Tensor, agg_feats: torch.Tensor
+    ) -> torch.Tensor:
+        """Add the per-column aggregate adapter residual to the pooled
+        output. No-op when agg is disabled (agg_dim == 0)."""
+        if not self.has_agg:
+            return output
+        return output + self.agg_adapter(agg_feats)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -2618,6 +2648,9 @@ class PCVRHyFormer(nn.Module):
         # 7c. Recency / activity adapter (exp/v9-mixed-dpe-recency)
         output = self._apply_recency(output, inputs.recency_feats)
 
+        # 7d. Per-column aggregate adapter (exp/v9-mixed-dpe-recency-aggs)
+        output = self._apply_agg(output, inputs.agg_feats)
+
         # 7. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
@@ -2698,6 +2731,9 @@ class PCVRHyFormer(nn.Module):
 
         # Recency / activity adapter (exp/v9-mixed-dpe-recency)
         output = self._apply_recency(output, inputs.recency_feats)
+
+        # Per-column aggregate adapter (exp/v9-mixed-dpe-recency-aggs)
+        output = self._apply_agg(output, inputs.agg_feats)
 
         logits = self.clsfier(output)
         return logits, output

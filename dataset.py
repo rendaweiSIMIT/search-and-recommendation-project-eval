@@ -160,6 +160,28 @@ RECENCY_FEAT_DIM = 4 * RECENCY_FEATS_PER_DOMAIN  # 4 domains
 # (real range ~0..18).
 RECENCY_EMPTY_SENTINEL = 20.0
 
+# ───────── Per-column aggregate scalars (exp/v9-mixed-dpe-recency-aggs) ─────
+# EDA's TSV table has via_mean / via_max / via_first_nz columns -- the 1-D
+# AUC of using just that aggregation of the column. For some side-info
+# columns the via_mean / via_max is the source of the column's 1-D signal,
+# yet the model only sees the column through a target-aware DIN attention
+# pooling (a learned, target-conditional weighted sum) -- there is no
+# guarantee that pooling matches the uniform mean / max that EDA scored.
+# We lift those specific aggregations as per-row scalars so the model
+# can use the EDA-validated signal directly. log1p-compressed.
+AGG_FEATURE_SPECS = [
+    # (seq_domain, fid, agg)   -- chosen by EDA top via_mean / via_max AUC
+    ('seq_c', 28, 'mean'),  # 0.573  strongest single feature outside time
+    ('seq_a', 40, 'mean'),  # 0.562
+    ('seq_c', 33, 'mean'),  # 0.556
+    ('seq_c', 32, 'mean'),  # 0.473  (reversed, signal 0.054)
+    ('seq_a', 45, 'max'),   # 0.534  -- 96% zeros, max captures rare highs
+    ('seq_a', 44, 'max'),   # 0.531
+    ('seq_b', 68, 'max'),   # 0.526
+    ('seq_a', 42, 'max'),   # 0.524
+]
+AGG_FEAT_DIM = len(AGG_FEATURE_SPECS)  # 8
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -219,6 +241,10 @@ class PCVRParquetDataset(IterableDataset):
         self.is_training = is_training
         # recency / activity features emitted per row (exp/v9-mixed-dpe-recency).
         self.recency_dim = RECENCY_FEAT_DIM
+        # per-row aggregate scalars (exp/v9-mixed-dpe-recency-aggs).
+        # Resolved (domain, slot, agg, out_idx) tuples are built in
+        # _load_schema once sideinfo_fids is known.
+        self.agg_dim = AGG_FEAT_DIM
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -373,6 +399,16 @@ class PCVRParquetDataset(IterableDataset):
 
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
+
+        # Resolve AGG_FEATURE_SPECS to (domain, slot, agg, out_idx) tuples.
+        # Specs referencing a domain/fid not present in this schema are
+        # silently dropped (graceful degradation; the unused output index
+        # stays 0 in agg_feats).
+        self._agg_plan: List[Tuple[str, int, str, int]] = []
+        for out_idx, (domain, fid, agg) in enumerate(AGG_FEATURE_SPECS):
+            if domain in self.sideinfo_fids and fid in self.sideinfo_fids[domain]:
+                slot = self.sideinfo_fids[domain].index(fid)
+                self._agg_plan.append((domain, slot, agg, out_idx))
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -795,6 +831,27 @@ class PCVRParquetDataset(IterableDataset):
             result[f'{domain}_time_span_bucket'] = torch.from_numpy(time_span.copy())
 
         result['recency_feats'] = torch.from_numpy(recency_feats)
+
+        # ---- per-column aggregate scalars (exp/v9-mixed-dpe-recency-aggs) ----
+        # log1p of either uniform mean or max of the column's value over the
+        # user's valid (non-padding) sequence positions. Computed after the
+        # seq loop populated self._buf_seq[domain].
+        agg_feats = np.zeros((B, AGG_FEAT_DIM), dtype=np.float32)
+        for domain, slot, agg, out_idx in self._agg_plan:
+            domain_len = self._buf_seq_lens[domain][:B]
+            max_len = self._seq_maxlen[domain]
+            vals = self._buf_seq[domain][:B, slot, :]
+            pos_mask = (np.arange(max_len)[None, :] < domain_len[:, None])
+            if agg == 'mean':
+                s = (vals.astype(np.float64) * pos_mask).sum(axis=1)
+                denom = domain_len.clip(min=1).astype(np.float64)
+                feat = s / denom
+            else:  # 'max'
+                vals_masked = np.where(pos_mask, vals.astype(np.float64), -1.0)
+                feat = vals_masked.max(axis=1)
+                feat = np.where(domain_len > 0, feat, 0.0)
+            agg_feats[:, out_idx] = np.log1p(np.maximum(feat, 0.0))
+        result['agg_feats'] = torch.from_numpy(agg_feats)
 
         return result
 
