@@ -450,6 +450,55 @@ def _batch_to_model_input(
     )
 
 
+def _run_inference_pass(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: str,
+    batch_size: int,
+) -> Tuple[List[Any], List[float]]:
+    """Single deterministic inference pass over test_loader.
+
+    Returns (user_ids, probs) in row order. Because PCVRParquetDataset
+    is constructed with shuffle=False, repeated passes yield the SAME row
+    order -- so ensemble code can element-wise average without re-keying
+    by user_id.
+    """
+    all_probs: List[float] = []
+    all_user_ids: List[Any] = []
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_loader):
+            model_input = _batch_to_model_input(batch, device)
+            user_ids = batch.get("user_id", [])
+            logits, _ = model.predict(model_input)
+            logits = logits.squeeze(-1)
+            probs = torch.sigmoid(logits).detach().cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_user_ids.extend(user_ids)
+            if (batch_idx + 1) % 100 == 0:
+                logging.info(
+                    f"Processed about {(batch_idx + 1) * batch_size} samples")
+    return all_user_ids, all_probs
+
+
+def _load_model_states(ckpt_path: str, device: str) -> List[Dict[str, Any]]:
+    """Load one or more state_dicts from ``ckpt_path``.
+
+    Standard checkpoint: returns ``[state_dict]``.
+    Ensemble bundle (dict with ``ensemble=True``, ``state_dicts=[...]``):
+    returns the list of state_dicts. Inference will then run one pass per
+    state_dict and average the per-sample probabilities.
+    """
+    obj = torch.load(ckpt_path, map_location=device)
+    if isinstance(obj, dict) and obj.get('ensemble') is True:
+        sds = obj['state_dicts']
+        logging.info(
+            f"Ensemble bundle detected at {ckpt_path}: {len(sds)} members; "
+            f"epochs={obj.get('epochs', '?')}, val_aucs={obj.get('val_aucs', '?')}")
+        return sds
+    return [obj]
+
+
 def main() -> None:
     model_dir = os.environ.get("MODEL_OUTPUT_PATH")
     data_dir = os.environ.get("EVAL_DATA_PATH")
@@ -535,9 +584,7 @@ def main() -> None:
         )
 
     logging.info(f"Loading checkpoint from {ckpt_path}")
-    load_model_state_strict(model, ckpt_path, device)
-    model.eval()
-    logging.info("Model loaded successfully")
+    state_dicts = _load_model_states(ckpt_path, device)
 
     loader_kwargs: Dict[str, Any] = {
         "dataset": test_dataset,
@@ -550,25 +597,38 @@ def main() -> None:
 
     test_loader = DataLoader(**loader_kwargs)
 
-    all_probs: List[float] = []
+    # Single-model: 1 pass. Ensemble bundle: N passes, average per-sample.
+    # PCVRParquetDataset is shuffle=False so passes yield the same row order,
+    # which lets us element-wise average without re-keying by user_id.
+    all_probs_runs: List[List[float]] = []
     all_user_ids: List[Any] = []
+    for i, sd in enumerate(state_dicts):
+        try:
+            model.load_state_dict(sd, strict=True)
+        except RuntimeError as e:
+            logging.error(
+                "Failed to load state_dict in strict mode. This usually means "
+                "the model constructed by infer.py does NOT match the checkpoint. "
+                "Check train_config.json, schema.json, ns_groups.json, model.py.")
+            raise e
+        if len(state_dicts) > 1:
+            logging.info(
+                f"Starting inference: ensemble member {i + 1}/{len(state_dicts)}")
+        else:
+            logging.info("Starting inference...")
+        uids, probs = _run_inference_pass(model, test_loader, device, batch_size)
+        if not all_user_ids:
+            all_user_ids = uids
+        all_probs_runs.append(probs)
 
-    logging.info("Starting inference...")
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
-            model_input = _batch_to_model_input(batch, device)
-            user_ids = batch.get("user_id", [])
-
-            logits, _ = model.predict(model_input)
-            logits = logits.squeeze(-1)
-
-            probs = torch.sigmoid(logits).detach().cpu().numpy()
-            all_probs.extend(probs.tolist())
-            all_user_ids.extend(user_ids)
-
-            if (batch_idx + 1) % 100 == 0:
-                logging.info(f"Processed about {(batch_idx + 1) * batch_size} samples")
+    if len(all_probs_runs) == 1:
+        all_probs = all_probs_runs[0]
+    else:
+        # Element-wise mean of per-sample probabilities across ensemble members.
+        n = len(all_probs_runs)
+        all_probs = [sum(run[i] for run in all_probs_runs) / n
+                     for i in range(len(all_user_ids))]
+        logging.info(f"Averaged probabilities across {n} ensemble members")
 
     logging.info(f"Inference complete: {len(all_probs)} predictions")
 
